@@ -1,0 +1,58 @@
+# --- Build firmware (PlatformIO) ---
+.pio/
+.pio-core/
+build/
+dist/
+*.bin
+*.elf
+*.map
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# --- Dati e output locali del generatore mappe ---
+*.pbf
+*.pbf.part
+*.osm.mmap
+*.mmap
+.pbf_cache/
+tiles/
+tiles_*/
+maps/
+scratch/
+log_serial.txt
+monomesh_serial.log
+
+# --- Toolchain e binari nativi ---
+tools/.toolchain/
+tools/native/
+tools/auto_flash_and_monitor.py
+tools/native/monomesh-tiles
+tools/native/.zig-cache/
+tools/tests/test_native.py
+
+# --- Riferimenti e materiale di terzi (solo in locale) ---
+reference/
+M5PaperMono-PowerDemo-main/
+M5Burner*.zip
+
+# --- Briefing di sessione / agenti / documentazione interna ---
+.agents/
+.codex/
+HANDOFF_PROMPT.md
+README_INTERNAL.md
+
+# --- Editor e sistema operativo ---
+.vscode/
+.idea/
+*.code-workspace
+.DS_Store
+Thumbs.db
+
+# --- Archivi e log vari ---
+*.zip
+*.7z
+*.log

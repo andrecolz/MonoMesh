@@ -1,0 +1,6 @@
+# Dipendenze Python degli strumenti mappa (tools/mmap_converter.py, tools/mono_map.py
+# e tools/tests). Installazione: python3 -m pip install -r requirements.txt
+Pillow>=10.0
+osmium>=3.6
+rich>=13.0
+requests>=2.31
