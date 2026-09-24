@@ -201,7 +201,8 @@ void ViewNodes::draw(M5GFX& gfx) {
         size_t startIdx = (size_t)(_currentPage - 1) * PAGE_SIZE;
         size_t endIdx = std::min(startIdx + PAGE_SIZE, nodes.size());
 
-        int startY = 82;
+        // Same 8 px gap under the header line as the chat list (first card at y=84).
+        int startY = 84;
         for (size_t i = startIdx; i < endIdx; ++i) {
             const auto& node = nodes[i];
             int cardIndexOnPage = (int)(i - startIdx);
@@ -426,7 +427,8 @@ bool ViewNodes::handleTouch(const TouchEvent& ev) {
     size_t startIdx = (size_t)(_currentPage - 1) * PAGE_SIZE;
     size_t endIdx = std::min(startIdx + PAGE_SIZE, nodes.size());
 
-    int startY = 82;
+    // Same 8 px gap under the header line as the chat list (first card at y=84).
+    int startY = 84;
     for (size_t i = startIdx; i < endIdx; ++i) {
         int cardIndexOnPage = (int)(i - startIdx);
         int cardY = startY + cardIndexOnPage * 88;

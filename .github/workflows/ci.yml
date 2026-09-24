@@ -53,3 +53,12 @@ jobs:
 
       - name: Build
         run: pio run -e m5paper-mono
+
+      - name: Immagine factory (header DIO obbligatorio)
+        run: python3 tools/make_factory_bin.py -o dist/MonoMesh.factory.bin
+
+      - name: Carica l'immagine factory
+        uses: actions/upload-artifact@v4
+        with:
+          name: MonoMesh-factory-bin
+          path: dist/MonoMesh.factory.bin

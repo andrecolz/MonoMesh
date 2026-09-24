@@ -25,7 +25,7 @@ namespace SWSettings {
 // has the same box length.
 constexpr int CONTENT_X = 14;
 constexpr int CONTENT_W = 452;
-constexpr int CONTENT_TOP = 82;      // first row, under the 32 px page header (44..76)
+constexpr int CONTENT_TOP = 84;      // first row: header line at 76 + the 8 px gap of the chat cards
 constexpr int CONTENT_BOTTOM = 729;  // nav bar starts at 730
 constexpr int GAP = 6;
 constexpr int ROW_H = 56;            // standard row (toggle / stepper / value / action)
@@ -126,15 +126,15 @@ inline void chevron(M5GFX& g, int cx, int cy, uint16_t color = TFT_BLACK) {
     }
 }
 
-inline void switchControl(M5GFX& g, int x, int y, bool on) {
+inline void switchControl(M5GFX& g, int x, int y, bool on, uint16_t fg = TFT_BLACK, uint16_t bg = TFT_WHITE) {
     const int w = 76, h = 34;
     if (on) {
-        g.fillRoundRect(x, y, w, h, h / 2, TFT_BLACK);
-        g.fillCircle(x + w - h / 2, y + h / 2, h / 2 - 6, TFT_WHITE);
+        g.fillRoundRect(x, y, w, h, h / 2, fg);
+        g.fillCircle(x + w - h / 2, y + h / 2, h / 2 - 6, bg);
     } else {
-        g.drawRoundRect(x, y, w, h, h / 2, TFT_BLACK);
-        g.fillRoundRect(x + 1, y + 1, w - 2, h - 2, h / 2 - 1, TFT_WHITE);
-        g.fillCircle(x + h / 2, y + h / 2, h / 2 - 7, TFT_BLACK);
+        g.drawRoundRect(x, y, w, h, h / 2, fg);
+        g.fillRoundRect(x + 1, y + 1, w - 2, h - 2, h / 2 - 1, bg);
+        g.fillCircle(x + h / 2, y + h / 2, h / 2 - 7, fg);
     }
 }
 
@@ -479,6 +479,208 @@ inline bool confirmHitOk(const TouchEvent& ev) {
 inline bool inConfirmCard(const TouchEvent& ev) {
     return inRect(ev, CONFIRM_X, CONFIRM_Y, CONFIRM_W, CONFIRM_H);
 }
+
+// ---------------------------------------------------------------- pickers
+inline int daysInMonth(int year, int month) {
+    static const int d[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    if (month < 1) month = 1;
+    if (month > 12) month = 12;
+    if (month == 2) {
+        const bool leap = ((year % 4 == 0) && (year % 100 != 0)) || (year % 400 == 0);
+        return leap ? 29 : 28;
+    }
+    return d[month - 1];
+}
+
+// Time picker (HH:MM with up/down arrows and Cancel/OK). Geometry and drawing live here so the
+// settings page and the alarm editor show the exact same control; the caller owns the values and
+// the arrow auto-repeat timing.
+namespace TimePicker {
+constexpr int X = 40;
+constexpr int Y = 170;
+constexpr int W = 400;
+constexpr int H = 460;
+constexpr int ARROW_W = 80;
+constexpr int ARROW_H = 56;
+constexpr int UP_Y = Y + 56;
+constexpr int DOWN_Y = Y + 268;
+constexpr int DIGITS_CY = Y + 190;
+constexpr int HOUR_CX = 195;
+constexpr int MIN_CX = 285;
+constexpr int DIGITS_X = X + 80;
+constexpr int DIGITS_Y = DIGITS_CY - 30;
+constexpr int DIGITS_W = W - 160;
+constexpr int DIGITS_H = 60;
+constexpr int BTN_Y = Y + H - 18 - MODAL_BTN_H;
+constexpr int BTN_W = 170;
+constexpr int OK_X = X + W - 18 - BTN_W;
+
+inline void drawDigits(M5GFX& g, int hour, int minute) {
+    g.fillRect(DIGITS_X, DIGITS_Y, DIGITS_W, DIGITS_H, TFT_WHITE);
+    g.setTextColor(TFT_BLACK, TFT_WHITE);
+    g.setTextDatum(textdatum_t::middle_center);
+    g.setTextSize(5);
+    char buf[8];
+    snprintf(buf, sizeof(buf), "%02d:%02d", hour, minute);
+    g.drawString(buf, X + W / 2, DIGITS_CY);
+}
+
+inline void draw(M5GFX& g, int hour, int minute, bool digitsOnly = false) {
+    if (!digitsOnly) {
+        modalCard(g, X, Y, W, H, "SET TIME");
+        const int centers[2] = {HOUR_CX, MIN_CX};
+        for (int i = 0; i < 2; ++i) {
+            for (int up = 0; up < 2; ++up) {
+                const int by = up ? DOWN_Y : UP_Y;
+                const int bx = centers[i] - ARROW_W / 2;
+                g.drawRoundRect(bx, by, ARROW_W, ARROW_H, 5, TFT_BLACK);
+                g.fillRoundRect(bx + 1, by + 1, ARROW_W - 2, ARROW_H - 2, 4, TFT_LIGHTGRAY);
+                const int cx = centers[i];
+                const int cy = by + ARROW_H / 2;
+                if (up) {
+                    g.fillTriangle(cx - 14, cy + 8, cx + 14, cy + 8, cx, cy - 10, TFT_BLACK);
+                } else {
+                    g.fillTriangle(cx - 14, cy - 8, cx + 14, cy - 8, cx, cy + 10, TFT_BLACK);
+                }
+            }
+        }
+        g.drawRoundRect(X + 18, BTN_Y, BTN_W, MODAL_BTN_H, 6, TFT_BLACK);
+        g.fillRoundRect(X + 19, BTN_Y + 1, BTN_W - 2, MODAL_BTN_H - 2, 5, TFT_LIGHTGRAY);
+        g.setTextColor(TFT_BLACK, TFT_LIGHTGRAY);
+        g.setTextDatum(textdatum_t::middle_center);
+        g.setTextSize(2);
+        g.drawString("CANCEL", X + 18 + BTN_W / 2, BTN_Y + MODAL_BTN_H / 2);
+        g.drawRoundRect(OK_X, BTN_Y, BTN_W, MODAL_BTN_H, 6, TFT_BLACK);
+        g.fillRoundRect(OK_X + 1, BTN_Y + 1, BTN_W - 2, MODAL_BTN_H - 2, 5, TFT_BLACK);
+        g.setTextColor(TFT_WHITE, TFT_BLACK);
+        g.drawString("OK", OK_X + BTN_W / 2, BTN_Y + MODAL_BTN_H / 2);
+    }
+    drawDigits(g, hour, minute);
+}
+
+// Arrow hit: 0 = none, 1 = hour+, 2 = hour-, 3 = minute+, 4 = minute-.
+inline int arrowHit(const TouchEvent& ev) {
+    const int centers[2] = {HOUR_CX, MIN_CX};
+    for (int i = 0; i < 2; ++i) {
+        const int bx = centers[i] - ARROW_W / 2;
+        if (inRect(ev, bx, UP_Y, ARROW_W, ARROW_H)) return 1 + i * 2;
+        if (inRect(ev, bx, DOWN_Y, ARROW_W, ARROW_H)) return 2 + i * 2;
+    }
+    return 0;
+}
+
+inline bool hitCancel(const TouchEvent& ev) { return inRect(ev, X + 18, BTN_Y, BTN_W, MODAL_BTN_H); }
+inline bool hitOk(const TouchEvent& ev) { return inRect(ev, OK_X, BTN_Y, BTN_W, MODAL_BTN_H); }
+
+inline bool step(int& hour, int& minute, int button) {
+    switch (button) {
+        case 1: hour = (hour + 1) % 24; break;
+        case 2: hour = (hour + 23) % 24; break;
+        case 3: minute = (minute + 1) % 60; break;
+        case 4: minute = (minute + 59) % 60; break;
+        default: return false;
+    }
+    return true;
+}
+} // namespace TimePicker
+
+// Date picker (DD/MM/YYYY), same card/arrow language as the time picker.
+namespace DatePicker {
+constexpr int X = 30;
+constexpr int Y = 170;
+constexpr int W = 420;
+constexpr int H = 460;
+constexpr int DD_CX = 105;
+constexpr int MM_CX = 240;
+constexpr int YY_CX = 375;
+constexpr int DIGITS_CY = Y + 190;
+constexpr int DIGITS_X = X + 12;
+constexpr int DIGITS_Y = DIGITS_CY - 28;
+constexpr int DIGITS_W = W - 24;
+constexpr int DIGITS_H = 56;
+constexpr int BTN_Y = TimePicker::BTN_Y;
+constexpr int BTN_W = TimePicker::BTN_W;
+constexpr int OK_X = X + W - 18 - BTN_W;
+
+inline void drawDigits(M5GFX& g, int year, int month, int day) {
+    g.fillRect(DIGITS_X, DIGITS_Y, DIGITS_W, DIGITS_H, TFT_WHITE);
+    g.setTextColor(TFT_BLACK, TFT_WHITE);
+    g.setTextDatum(textdatum_t::middle_center);
+    g.setTextSize(4);
+    char d[4], m[4], y[8];
+    snprintf(d, sizeof(d), "%02d", day);
+    snprintf(m, sizeof(m), "%02d", month);
+    snprintf(y, sizeof(y), "%04d", year);
+    g.drawString(d, DD_CX, DIGITS_CY);
+    g.drawString(m, MM_CX, DIGITS_CY);
+    g.drawString(y, YY_CX, DIGITS_CY);
+}
+
+inline void draw(M5GFX& g, int year, int month, int day, bool digitsOnly = false) {
+    if (!digitsOnly) {
+        modalCard(g, X, Y, W, H, "SET DATE");
+        const int centers[3] = {DD_CX, MM_CX, YY_CX};
+        const int widths[3] = {100, 100, 130};
+        for (int i = 0; i < 3; ++i) {
+            for (int up = 0; up < 2; ++up) {
+                const int by = up ? TimePicker::DOWN_Y : TimePicker::UP_Y;
+                const int bx = centers[i] - widths[i] / 2;
+                g.drawRoundRect(bx, by, widths[i], TimePicker::ARROW_H, 5, TFT_BLACK);
+                g.fillRoundRect(bx + 1, by + 1, widths[i] - 2, TimePicker::ARROW_H - 2, 4, TFT_LIGHTGRAY);
+                const int cx = centers[i];
+                const int cy = by + TimePicker::ARROW_H / 2;
+                if (up) {
+                    g.fillTriangle(cx - 14, cy + 8, cx + 14, cy + 8, cx, cy - 10, TFT_BLACK);
+                } else {
+                    g.fillTriangle(cx - 14, cy - 8, cx + 14, cy - 8, cx, cy + 10, TFT_BLACK);
+                }
+            }
+        }
+        g.drawRoundRect(X + 18, BTN_Y, BTN_W, MODAL_BTN_H, 6, TFT_BLACK);
+        g.fillRoundRect(X + 19, BTN_Y + 1, BTN_W - 2, MODAL_BTN_H - 2, 5, TFT_LIGHTGRAY);
+        g.setTextColor(TFT_BLACK, TFT_LIGHTGRAY);
+        g.setTextDatum(textdatum_t::middle_center);
+        g.setTextSize(2);
+        g.drawString("CANCEL", X + 18 + BTN_W / 2, BTN_Y + MODAL_BTN_H / 2);
+        g.drawRoundRect(OK_X, BTN_Y, BTN_W, MODAL_BTN_H, 6, TFT_BLACK);
+        g.fillRoundRect(OK_X + 1, BTN_Y + 1, BTN_W - 2, MODAL_BTN_H - 2, 5, TFT_BLACK);
+        g.setTextColor(TFT_WHITE, TFT_BLACK);
+        g.drawString("OK", OK_X + BTN_W / 2, BTN_Y + MODAL_BTN_H / 2);
+    }
+    drawDigits(g, year, month, day);
+}
+
+// Arrow hit: 0 = none, 1 = day+, 2 = day-, 3 = month+, 4 = month-, 5 = year+, 6 = year-.
+inline int arrowHit(const TouchEvent& ev) {
+    const int centers[3] = {DD_CX, MM_CX, YY_CX};
+    const int widths[3] = {100, 100, 130};
+    for (int i = 0; i < 3; ++i) {
+        const int bx = centers[i] - widths[i] / 2;
+        if (inRect(ev, bx, TimePicker::UP_Y, widths[i], TimePicker::ARROW_H)) return 1 + i * 2;
+        if (inRect(ev, bx, TimePicker::DOWN_Y, widths[i], TimePicker::ARROW_H)) return 2 + i * 2;
+    }
+    return 0;
+}
+
+inline bool hitCancel(const TouchEvent& ev) { return inRect(ev, X + 18, BTN_Y, BTN_W, MODAL_BTN_H); }
+inline bool hitOk(const TouchEvent& ev) { return inRect(ev, OK_X, BTN_Y, BTN_W, MODAL_BTN_H); }
+
+inline bool step(int& year, int& month, int& day, int button) {
+    const int dim = daysInMonth(year, month);
+    switch (button) {
+        case 1: day = (day % dim) + 1; break;
+        case 2: day = (day <= 1) ? dim : day - 1; break;
+        case 3: month = (month % 12) + 1; break;
+        case 4: month = (month <= 1) ? 12 : month - 1; break;
+        case 5: if (year < 2099) ++year; break;
+        case 6: if (year > 2023) --year; break;
+        default: return false;
+    }
+    const int dimAfter = daysInMonth(year, month);
+    if (day > dimAfter) day = dimAfter;
+    return true;
+}
+} // namespace DatePicker
 
 } // namespace SWSettings
 } // namespace MonoMesh

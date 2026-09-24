@@ -84,6 +84,26 @@ struct SettingsConfig {
     bool meshTimeSync = true;      // accept RTC updates carried by mesh packets
 };
 
+// One alarm of the ALARMS view. Fixed layout (packed) so the whole list travels as a single NVS
+// blob or as one line per alarm in /monomesh/alarms.txt. The time is local wall-clock, the same
+// base the RX8130 holds, so the match is a plain field comparison.
+constexpr size_t MAX_ALARMS = 12;
+
+struct __attribute__((packed)) AlarmRecord {
+    char name[20];
+    uint8_t hour;      // 0..23
+    uint8_t minute;    // 0..59
+    uint8_t repeat;    // 0 = one date, 1 = weekly
+    uint8_t daysMask;  // weekly: bit0 = Monday ... bit6 = Sunday
+    uint16_t year;     // one date
+    uint8_t month;     // 1..12
+    uint8_t day;       // 1..31
+    uint8_t tone;      // 0 = gentle, 1 = calm, 2 = strong
+    bool backlight;    // frontlight on while ringing in standby/clock
+    bool powerWake;    // arm the RTC alarm so a powered-off unit wakes up
+    bool enabled;
+};
+
 struct SavedMessage {
     uint32_t id;
     uint32_t fromNode;
@@ -144,6 +164,18 @@ public:
     bool saveMapView(int32_t latE7, int32_t lonE7, uint8_t zoom);
     bool loadMapView(int32_t& latE7, int32_t& lonE7, uint8_t& zoom);
 
+    // Last-used order of the UI nav bar: pure UI state, kept ONLY on the SD card (a single
+    // comma-separated line in /monomesh/nav.txt), so it never costs NVS writes. Without a card the
+    // callers keep their in-RAM default.
+    bool saveNavHistory(const int* order, int count);
+    bool loadNavHistory(int* order, int count);
+
+    // Alarms. The SD card is the primary store when mounted (/monomesh/alarms.txt, one line per
+    // alarm), so the list survives even an NVS wipe; the single NVS blob is the fallback without a
+    // card and the mirror for the boot path. loadAlarms() prefers the card and falls back to NVS.
+    bool saveAlarms(const std::vector<AlarmRecord>& alarms);
+    bool loadAlarms(std::vector<AlarmRecord>& alarms);
+
     // Chat History
     bool appendChatMessage(const SavedMessage& msg);
     bool updateChatMessageAck(uint32_t id);
@@ -171,6 +203,12 @@ private:
     // (wiped partition, failed writes...), so the node name and the radio config are not lost.
     bool loadSettingsFromConfigJson(SettingsConfig& cfg);
 
+    // Alarm persistence helpers: the text mirror (one line per alarm) and the single NVS blob.
+    bool saveAlarmsFile(const std::vector<AlarmRecord>& alarms);
+    bool loadAlarmsFile(std::vector<AlarmRecord>& alarms);
+    bool saveAlarmsNvs(const std::vector<AlarmRecord>& alarms);
+    bool loadAlarmsNvs(std::vector<AlarmRecord>& alarms);
+
     // Compact node record for the NVS mirror: only what cannot be relearned cheaply (name, key, MAC,
     // last contact). Keeps the mirror to ~1.3 KB instead of ~5.6 KB so the 24 KB NVS partition that
     // also holds settings, keys and the message ring never runs out of space.
@@ -188,6 +226,11 @@ private:
     bool _sdMounted = false;
     uint64_t _sdTotalBytes = 0;
     uint64_t _sdFreeBytes = 0;
+
+    // When an alarm save happens while the card is unmounted (ringing in standby disables the
+    // one-shot), the text mirror is stale: keep the list and rewrite the file at the remount.
+    bool _alarmsFileDirty = false;
+    std::vector<AlarmRecord> _alarmsFileCache;
 
     bool initSdCard();
 };

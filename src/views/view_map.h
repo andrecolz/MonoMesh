@@ -15,7 +15,7 @@ namespace MonoMesh {
 //  * tiles come from a packed .mmap container (see map_pack.h) or, as a
 //    fallback, from the legacy /tiles/z/x/y.png tree;
 //  * dragging shifts the canvas and republishes to the panel only the strip
-//    that the shift uncovered, instead of the full 480x582 area;
+//    that the shift uncovered, instead of the full 480x583 area;
 //  * the 4-level "settling" pass ~1 s after the finger stops still refreshes the
 //    whole area (that is how the panel's half-mode update works).
 class ViewMap : public ViewBase {
@@ -35,12 +35,12 @@ public:
 private:
     // ---- geometry, shared by draw() and handleTouch() so the hit boxes cannot drift ----
     static constexpr int MAP_VIEW_Y = 44;              // the status bar occupies 0..43
-    static constexpr int HDR_H = 34;                   // map header: 44..77
-    static constexpr int MAP_TOP = MAP_VIEW_Y + HDR_H; // first tile row: 78
+    static constexpr int HDR_H = 32;                   // map header: 44..75, line at 76 like every view
+    static constexpr int MAP_TOP = MAP_VIEW_Y + HDR_H + 1; // first tile row: 77, flush under the header line
     static constexpr int MAP_BOTTOM = 729;             // nav bar starts at 730
     static constexpr int MAP_H = MAP_BOTTOM - MAP_TOP + 1; // map area + info card (flush range)
     static constexpr int MAP_CX = 240;
-    static constexpr int MAP_CY = 368;                 // centre of the free area 78..659
+    static constexpr int MAP_CY = 368;                 // centre of the free area 77..659
     static constexpr int MAP_TILE_BOTTOM = 659;        // info card starts at 660
     static constexpr int CARD_Y = 660;
     static constexpr int CARD_H = 60;

@@ -1197,9 +1197,9 @@ void ViewMap::draw(M5GFX& gfx) {
 // ---------------------------------------------------------------- drawing
 
 void ViewMap::drawHeader(M5GFX& gfx) {
-    // Dot-screen bar (black text) like the other view headers.
+    // Dot-screen bar (black text) like the other view headers: 32 px tall, bottom line at 76.
     headerBackground(gfx, MAP_VIEW_Y, HDR_H);
-    gfx.drawFastHLine(0, MAP_TOP - 1, 480, TFT_BLACK);
+    gfx.drawFastHLine(0, MAP_VIEW_Y + HDR_H, 480, TFT_BLACK);
 
     gfx.setTextColor(TFT_BLACK);
     gfx.setTextDatum(textdatum_t::middle_left);

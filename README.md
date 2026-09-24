@@ -25,26 +25,15 @@ Current release: **v1.0b (beta)**
   limit, channel name and PSK, node identity and role, broadcast intervals,
   TX duty-cycle budget, rebroadcast mode, buzzer mode, timezone/RTC, clock
   orientation and storage info.
+- **Alarms** — up to 12 alarms with a name, one exact date or weekly days,
+  three buzzer ringtones, optional frontlight while ringing and per-alarm
+  "wake from off": the RTC alarm can power the board back on. They ring as a
+  popup in the UI and on the clock face (with the alarm name) in standby/clock.
 - **Power modes** — power off, standby with the radio always listening, giant
   clock, clock + RX; battery protection and configurable power-button action.
 - **Works without MicroSD** — settings, keys and recent messages persist in
-  NVS; the card adds full chat history, node database and maps.
-
-## Hardware
-
-M5Stack Paper Mono: ESP32-S3, 4.7" 480×800 e-paper (SSD1677), Semtech SX1262
-LoRa (EU868 by default, region and preset configurable on screen), PMIC and IO
-expander, capacitive touch, RTC and MicroSD slot.
-
-## Build and flash
-
-Requires [PlatformIO](https://platformio.org/) and a USB-C data cable.
-
-```bash
-pio run -e m5paper-mono                                              # build
-pio run -e m5paper-mono -t upload --upload-port /dev/ttyACM0        # flash
-pio device monitor -p /dev/ttyACM0 -b 115200                        # serial log
-```
+  NVS; the card adds full chat history, node database, maps and the alarm
+  list mirror (`/monomesh/alarms.txt`).
 
 ## Offline maps
 
@@ -57,30 +46,9 @@ keys:
 python3 -m pip install -r requirements.txt
 
 # one .mmap container for the area around a point (recommended)
-python3 tools/mmap_converter.py --pbf region.osm.pbf \
-    --lat 45.4642 --lon 9.1900 --radius_km 10 --zooms 12,13,14
+python3 tools/mmap_converter.py --tui
 
-# inspect, verify or convert an existing container / PNG tree
-python3 tools/mono_map.py info   maps/region.mmap
-python3 tools/mono_map.py verify maps/region.mmap --tiles-dir tiles --sample 400
-```
-
-Copy the resulting `.mmap` file into `/maps` on the MicroSD (or an old-style PNG
-tree into `/tiles`).
-
-## Repository layout
-
-- `src/` — firmware sources (Arduino framework)
-- `platformio.ini`, `partitions_16mb.csv` — build and flash layout
-- `tools/` — offline map pipeline and `.mmap` container tools
-- `tools/tests/` — Python test suite (run by CI)
-- `.github/workflows/ci.yml` — firmware build + tests on every push/PR
-
-## Test suite
-
-```bash
-python3 -m unittest discover -s tools/tests -v
-```
+Copy the resulting `.mmap` file into `/maps` on the MicroSD.
 
 ## License and attribution
 

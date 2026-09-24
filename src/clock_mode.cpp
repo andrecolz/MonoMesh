@@ -64,7 +64,7 @@ bool ClockMode::applyOrientation(bool landscape, bool flip180) {
     return (M5.Display.width() > M5.Display.height()) == landscape;
 }
 
-void ClockMode::drawFace(bool landscape, bool flip180) {
+void ClockMode::drawFace(bool landscape, bool flip180, const char* banner) {
     applyOrientation(landscape, flip180);
     Layout l = layoutFor(landscape);
 
@@ -75,6 +75,13 @@ void ClockMode::drawFace(bool landscape, bool flip180) {
     M5.Display.setEpdMode(m5gfx::epd_mode_t::epd_quality);
     M5.Display.fillScreen(TFT_WHITE);
     drawTime(M5.Display, l, hh, mm, valid, true, true);
+    if (banner && banner[0]) {
+        // Alarm name centred in the empty band above the digit ink box (28 px above its top edge).
+        M5.Display.setTextColor(TFT_BLACK, TFT_WHITE);
+        M5.Display.setTextDatum(textdatum_t::middle_center);
+        M5.Display.setTextSize(3);
+        M5.Display.drawString(banner, l.centerX, l.baseline - l.face.digitHeight - 28);
+    }
     M5.Display.display();
     M5.Display.waitDisplay();
 

@@ -143,39 +143,8 @@ static const RowDef STORAGE_ROWS[] = {
 };
 static constexpr int STORAGE_N = 10;
 
-// Time picker geometry (shared by draw and touch).
-static constexpr int TIME_X = 40;
-static constexpr int TIME_Y = 170;
-static constexpr int TIME_W = 400;
-static constexpr int TIME_H = 460;
-static constexpr int TIME_ARROW_W = 80;
-static constexpr int TIME_ARROW_H = 56;
-static constexpr int TIME_UP_Y = TIME_Y + 56;
-static constexpr int TIME_DOWN_Y = TIME_Y + 268;
-static constexpr int TIME_DIGITS_CY = TIME_Y + 190;
-static constexpr int TIME_HOUR_CX = 195;
-static constexpr int TIME_MIN_CX = 285;
-static constexpr int TIME_BTN_Y = TIME_Y + TIME_H - 18 - MODAL_BTN_H;
-static constexpr int TIME_BTN_W = 170;
-// Digits flush rect (used while the auto-repeat runs).
-static constexpr int TIME_DIGITS_X = TIME_X + 80;
-static constexpr int TIME_DIGITS_Y = TIME_DIGITS_CY - 30;
-static constexpr int TIME_DIGITS_W = TIME_W - 160;
-static constexpr int TIME_DIGITS_H = 60;
-
-// Date picker geometry.
-static constexpr int DATE_X = 30;
-static constexpr int DATE_Y = 170;
-static constexpr int DATE_W = 420;
-static constexpr int DATE_H = 460;
-static constexpr int DATE_DD_CX = 105;
-static constexpr int DATE_MM_CX = 240;
-static constexpr int DATE_YY_CX = 375;
-static constexpr int DATE_DIGITS_CY = DATE_Y + 190;
-static constexpr int DATE_DIGITS_X = DATE_X + 12;
-static constexpr int DATE_DIGITS_Y = DATE_DIGITS_CY - 28;
-static constexpr int DATE_DIGITS_W = DATE_W - 24;
-static constexpr int DATE_DIGITS_H = 56;
+// The time/date pickers are shared with the alarm editor: geometry, drawing and hit-testing live in
+// settings_widgets.h (SWSettings::TimePicker / DatePicker).
 
 // ---------------------------------------------------------------- small helpers
 static void formatInterval(uint32_t sec, char* out, size_t cap) {
@@ -188,17 +157,6 @@ static void formatInterval(uint32_t sec, char* out, size_t cap) {
     } else {
         snprintf(out, cap, "%uh %um", (unsigned)(sec / 3600), (unsigned)((sec % 3600) / 60));
     }
-}
-
-static int daysInMonth(int year, int month) {
-    static const int d[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
-    if (month < 1) month = 1;
-    if (month > 12) month = 12;
-    if (month == 2) {
-        const bool leap = ((year % 4 == 0) && (year % 100 != 0)) || (year % 400 == 0);
-        return leap ? 29 : 28;
-    }
-    return d[month - 1];
 }
 
 static const char* powerModeLabel(uint8_t action) {
@@ -282,10 +240,12 @@ void ViewSettings::update() {
             if (stepArrow(_arrowHeld)) {
                 if (_modal == Modal::Time) {
                     drawTimeModal(M5.Display, true);
-                    EPDDriver::getInstance().flushRect(TIME_DIGITS_X, TIME_DIGITS_Y, TIME_DIGITS_W, TIME_DIGITS_H);
+                    EPDDriver::getInstance().flushRect(TimePicker::DIGITS_X, TimePicker::DIGITS_Y,
+                                                       TimePicker::DIGITS_W, TimePicker::DIGITS_H);
                 } else if (_modal == Modal::Date) {
                     drawDateModal(M5.Display, true);
-                    EPDDriver::getInstance().flushRect(DATE_DIGITS_X, DATE_DIGITS_Y, DATE_DIGITS_W, DATE_DIGITS_H);
+                    EPDDriver::getInstance().flushRect(DatePicker::DIGITS_X, DatePicker::DIGITS_Y,
+                                                       DatePicker::DIGITS_W, DatePicker::DIGITS_H);
                 }
                 noteInteraction();
             }
@@ -733,91 +693,11 @@ void ViewSettings::drawModal(M5GFX& gfx) {
 }
 
 void ViewSettings::drawTimeModal(M5GFX& gfx, bool digitsOnly) {
-    if (!digitsOnly) {
-        modalCard(gfx, TIME_X, TIME_Y, TIME_W, TIME_H, "SET TIME");
-        // Up / down arrows under each field.
-        const int centers[2] = {TIME_HOUR_CX, TIME_MIN_CX};
-        for (int i = 0; i < 2; ++i) {
-            for (int up = 0; up < 2; ++up) {
-                const int by = up ? TIME_DOWN_Y : TIME_UP_Y;
-                const int bx = centers[i] - TIME_ARROW_W / 2;
-                gfx.drawRoundRect(bx, by, TIME_ARROW_W, TIME_ARROW_H, 5, TFT_BLACK);
-                gfx.fillRoundRect(bx + 1, by + 1, TIME_ARROW_W - 2, TIME_ARROW_H - 2, 4, TFT_LIGHTGRAY);
-                const int cx = centers[i];
-                const int cy = by + TIME_ARROW_H / 2;
-                if (up) {
-                    gfx.fillTriangle(cx - 14, cy + 8, cx + 14, cy + 8, cx, cy - 10, TFT_BLACK);
-                } else {
-                    gfx.fillTriangle(cx - 14, cy - 8, cx + 14, cy - 8, cx, cy + 10, TFT_BLACK);
-                }
-            }
-        }
-        // Cancel / OK
-        gfx.drawRoundRect(TIME_X + 18, TIME_BTN_Y, TIME_BTN_W, MODAL_BTN_H, 6, TFT_BLACK);
-        gfx.fillRoundRect(TIME_X + 19, TIME_BTN_Y + 1, TIME_BTN_W - 2, MODAL_BTN_H - 2, 5, TFT_LIGHTGRAY);
-        gfx.setTextColor(TFT_BLACK, TFT_LIGHTGRAY);
-        gfx.setTextDatum(textdatum_t::middle_center);
-        gfx.setTextSize(2);
-        gfx.drawString("CANCEL", TIME_X + 18 + TIME_BTN_W / 2, TIME_BTN_Y + MODAL_BTN_H / 2);
-        const int okX = TIME_X + TIME_W - 18 - TIME_BTN_W;
-        gfx.drawRoundRect(okX, TIME_BTN_Y, TIME_BTN_W, MODAL_BTN_H, 6, TFT_BLACK);
-        gfx.fillRoundRect(okX + 1, TIME_BTN_Y + 1, TIME_BTN_W - 2, MODAL_BTN_H - 2, 5, TFT_BLACK);
-        gfx.setTextColor(TFT_WHITE, TFT_BLACK);
-        gfx.drawString("OK", okX + TIME_BTN_W / 2, TIME_BTN_Y + MODAL_BTN_H / 2);
-    }
-    // Digits
-    gfx.fillRect(TIME_DIGITS_X, TIME_DIGITS_Y, TIME_DIGITS_W, TIME_DIGITS_H, TFT_WHITE);
-    gfx.setTextColor(TFT_BLACK, TFT_WHITE);
-    gfx.setTextDatum(textdatum_t::middle_center);
-    gfx.setTextSize(5);
-    char buf[8];
-    snprintf(buf, sizeof(buf), "%02d:%02d", _timeH, _timeM);
-    gfx.drawString(buf, TIME_X + TIME_W / 2, TIME_DIGITS_CY);
+    TimePicker::draw(gfx, _timeH, _timeM, digitsOnly);
 }
 
 void ViewSettings::drawDateModal(M5GFX& gfx, bool digitsOnly) {
-    if (!digitsOnly) {
-        modalCard(gfx, DATE_X, DATE_Y, DATE_W, DATE_H, "SET DATE");
-        const int centers[3] = {DATE_DD_CX, DATE_MM_CX, DATE_YY_CX};
-        const int widths[3] = {100, 100, 130};
-        for (int i = 0; i < 3; ++i) {
-            for (int up = 0; up < 2; ++up) {
-                const int by = up ? TIME_DOWN_Y : TIME_UP_Y;
-                const int bx = centers[i] - widths[i] / 2;
-                gfx.drawRoundRect(bx, by, widths[i], TIME_ARROW_H, 5, TFT_BLACK);
-                gfx.fillRoundRect(bx + 1, by + 1, widths[i] - 2, TIME_ARROW_H - 2, 4, TFT_LIGHTGRAY);
-                const int cx = centers[i];
-                const int cy = by + TIME_ARROW_H / 2;
-                if (up) {
-                    gfx.fillTriangle(cx - 14, cy + 8, cx + 14, cy + 8, cx, cy - 10, TFT_BLACK);
-                } else {
-                    gfx.fillTriangle(cx - 14, cy - 8, cx + 14, cy - 8, cx, cy + 10, TFT_BLACK);
-                }
-            }
-        }
-        gfx.drawRoundRect(DATE_X + 18, TIME_BTN_Y, TIME_BTN_W, MODAL_BTN_H, 6, TFT_BLACK);
-        gfx.fillRoundRect(DATE_X + 19, TIME_BTN_Y + 1, TIME_BTN_W - 2, MODAL_BTN_H - 2, 5, TFT_LIGHTGRAY);
-        gfx.setTextColor(TFT_BLACK, TFT_LIGHTGRAY);
-        gfx.setTextDatum(textdatum_t::middle_center);
-        gfx.setTextSize(2);
-        gfx.drawString("CANCEL", DATE_X + 18 + TIME_BTN_W / 2, TIME_BTN_Y + MODAL_BTN_H / 2);
-        const int okX = DATE_X + DATE_W - 18 - TIME_BTN_W;
-        gfx.drawRoundRect(okX, TIME_BTN_Y, TIME_BTN_W, MODAL_BTN_H, 6, TFT_BLACK);
-        gfx.fillRoundRect(okX + 1, TIME_BTN_Y + 1, TIME_BTN_W - 2, MODAL_BTN_H - 2, 5, TFT_BLACK);
-        gfx.setTextColor(TFT_WHITE, TFT_BLACK);
-        gfx.drawString("OK", okX + TIME_BTN_W / 2, TIME_BTN_Y + MODAL_BTN_H / 2);
-    }
-    gfx.fillRect(DATE_DIGITS_X, DATE_DIGITS_Y, DATE_DIGITS_W, DATE_DIGITS_H, TFT_WHITE);
-    gfx.setTextColor(TFT_BLACK, TFT_WHITE);
-    gfx.setTextDatum(textdatum_t::middle_center);
-    gfx.setTextSize(4);
-    char d[4], m[4], y[8];
-    snprintf(d, sizeof(d), "%02d", _dateD);
-    snprintf(m, sizeof(m), "%02d", _dateM);
-    snprintf(y, sizeof(y), "%04d", _dateY);
-    gfx.drawString(d, DATE_DD_CX, DATE_DIGITS_CY);
-    gfx.drawString(m, DATE_MM_CX, DATE_DIGITS_CY);
-    gfx.drawString(y, DATE_YY_CX, DATE_DIGITS_CY);
+    DatePicker::draw(gfx, _dateY, _dateM, _dateD, digitsOnly);
 }
 
 // ---------------------------------------------------------------- modal logic
@@ -1032,31 +912,8 @@ void ViewSettings::applyConfirm() {
 }
 
 bool ViewSettings::stepArrow(uint8_t button) {
-    if (_modal == Modal::Time) {
-        switch (button) {
-            case 1: _timeH = (_timeH + 1) % 24; break;
-            case 2: _timeH = (_timeH + 23) % 24; break;
-            case 3: _timeM = (_timeM + 1) % 60; break;
-            case 4: _timeM = (_timeM + 59) % 60; break;
-            default: return false;
-        }
-        return true;
-    }
-    if (_modal == Modal::Date) {
-        const int dim = daysInMonth(_dateY, _dateM);
-        switch (button) {
-            case 1: _dateD = (_dateD % dim) + 1; break;
-            case 2: _dateD = (_dateD <= 1) ? dim : _dateD - 1; break;
-            case 3: _dateM = (_dateM % 12) + 1; break;
-            case 4: _dateM = (_dateM <= 1) ? 12 : _dateM - 1; break;
-            case 5: if (_dateY < 2099) _dateY++; break;
-            case 6: if (_dateY > 2023) _dateY--; break;
-            default: return false;
-        }
-        const int dimAfter = daysInMonth(_dateY, _dateM);
-        if (_dateD > dimAfter) _dateD = dimAfter;
-        return true;
-    }
+    if (_modal == Modal::Time) return TimePicker::step(_timeH, _timeM, button);
+    if (_modal == Modal::Date) return DatePicker::step(_dateY, _dateM, _dateD, button);
     return false;
 }
 
@@ -1391,7 +1248,7 @@ bool ViewSettings::handleDateTimeTouch(const TouchEvent& ev) {
             }
             _modal = Modal::Time;
             drawModal(M5.Display);
-            EPDDriver::getInstance().flushRect(TIME_X, TIME_Y, TIME_W, TIME_H);
+            EPDDriver::getInstance().flushRect(TimePicker::X, TimePicker::Y, TimePicker::W, TimePicker::H);
             noteInteraction();
             return true;
         }
@@ -1408,7 +1265,7 @@ bool ViewSettings::handleDateTimeTouch(const TouchEvent& ev) {
             if (_dateD < 1 || _dateD > daysInMonth(_dateY, _dateM)) _dateD = 1;
             _modal = Modal::Date;
             drawModal(M5.Display);
-            EPDDriver::getInstance().flushRect(DATE_X, DATE_Y, DATE_W, DATE_H);
+            EPDDriver::getInstance().flushRect(DatePicker::X, DatePicker::Y, DatePicker::W, DatePicker::H);
             noteInteraction();
             return true;
         }
@@ -1474,29 +1331,17 @@ bool ViewSettings::handleModalTouch(const TouchEvent& ev) {
         case Modal::Time: {
             if (ev.type == TouchEventType::Down) {
                 // Up/down arrows: hours and minutes.
-                const int centers[2] = {TIME_HOUR_CX, TIME_MIN_CX};
-                for (int i = 0; i < 2; ++i) {
-                    const int bx = centers[i] - TIME_ARROW_W / 2;
-                    if (inRect(ev, bx, TIME_UP_Y, TIME_ARROW_W, TIME_ARROW_H)) {
-                        _arrowHeld = (uint8_t)(1 + i * 2);
-                        _arrowNextRepeatMs = millis() + 450;
-                        if (stepArrow(_arrowHeld)) {
-                            drawTimeModal(M5.Display, true);
-                            EPDDriver::getInstance().flushRect(TIME_DIGITS_X, TIME_DIGITS_Y, TIME_DIGITS_W, TIME_DIGITS_H);
-                            noteInteraction();
-                        }
-                        return true;
+                const int hit = TimePicker::arrowHit(ev);
+                if (hit != 0) {
+                    _arrowHeld = (uint8_t)hit;
+                    _arrowNextRepeatMs = millis() + 450;
+                    if (stepArrow(_arrowHeld)) {
+                        drawTimeModal(M5.Display, true);
+                        EPDDriver::getInstance().flushRect(TimePicker::DIGITS_X, TimePicker::DIGITS_Y,
+                                                           TimePicker::DIGITS_W, TimePicker::DIGITS_H);
+                        noteInteraction();
                     }
-                    if (inRect(ev, bx, TIME_DOWN_Y, TIME_ARROW_W, TIME_ARROW_H)) {
-                        _arrowHeld = (uint8_t)(2 + i * 2);
-                        _arrowNextRepeatMs = millis() + 450;
-                        if (stepArrow(_arrowHeld)) {
-                            drawTimeModal(M5.Display, true);
-                            EPDDriver::getInstance().flushRect(TIME_DIGITS_X, TIME_DIGITS_Y, TIME_DIGITS_W, TIME_DIGITS_H);
-                            noteInteraction();
-                        }
-                        return true;
-                    }
+                    return true;
                 }
                 return true; // swallows taps on the card outside the controls
             }
@@ -1506,14 +1351,14 @@ bool ViewSettings::handleModalTouch(const TouchEvent& ev) {
             }
             if (ev.type != TouchEventType::Click) return true;
             // OK / Cancel
-            if (inRect(ev, TIME_X + 18, TIME_BTN_Y, TIME_BTN_W, MODAL_BTN_H)) {
+            if (TimePicker::hitCancel(ev)) {
                 _modal = Modal::None;
                 drawPage(M5.Display);
                 flushContentGrayscale();
                 noteInteraction();
                 return true;
             }
-            if (inRect(ev, TIME_X + TIME_W - 18 - TIME_BTN_W, TIME_BTN_Y, TIME_BTN_W, MODAL_BTN_H)) {
+            if (TimePicker::hitOk(ev)) {
                 int hh = 0, mm = 0, ss = 0, yy = 0, mo = 0, dd = 0;
                 BSP::getInstance().getLocalDateTime(yy, mo, dd, hh, mm, ss);
                 if (!BSP::getInstance().isRtcValid()) {
@@ -1533,30 +1378,17 @@ bool ViewSettings::handleModalTouch(const TouchEvent& ev) {
         }
         case Modal::Date: {
             if (ev.type == TouchEventType::Down) {
-                const int centers[3] = {DATE_DD_CX, DATE_MM_CX, DATE_YY_CX};
-                const int widths[3] = {100, 100, 130};
-                for (int i = 0; i < 3; ++i) {
-                    const int bx = centers[i] - widths[i] / 2;
-                    if (inRect(ev, bx, TIME_UP_Y, widths[i], TIME_ARROW_H)) {
-                        _arrowHeld = (uint8_t)(1 + i * 2);
-                        _arrowNextRepeatMs = millis() + 450;
-                        if (stepArrow(_arrowHeld)) {
-                            drawDateModal(M5.Display, true);
-                            EPDDriver::getInstance().flushRect(DATE_DIGITS_X, DATE_DIGITS_Y, DATE_DIGITS_W, DATE_DIGITS_H);
-                            noteInteraction();
-                        }
-                        return true;
+                const int hit = DatePicker::arrowHit(ev);
+                if (hit != 0) {
+                    _arrowHeld = (uint8_t)hit;
+                    _arrowNextRepeatMs = millis() + 450;
+                    if (stepArrow(_arrowHeld)) {
+                        drawDateModal(M5.Display, true);
+                        EPDDriver::getInstance().flushRect(DatePicker::DIGITS_X, DatePicker::DIGITS_Y,
+                                                           DatePicker::DIGITS_W, DatePicker::DIGITS_H);
+                        noteInteraction();
                     }
-                    if (inRect(ev, bx, TIME_DOWN_Y, widths[i], TIME_ARROW_H)) {
-                        _arrowHeld = (uint8_t)(2 + i * 2);
-                        _arrowNextRepeatMs = millis() + 450;
-                        if (stepArrow(_arrowHeld)) {
-                            drawDateModal(M5.Display, true);
-                            EPDDriver::getInstance().flushRect(DATE_DIGITS_X, DATE_DIGITS_Y, DATE_DIGITS_W, DATE_DIGITS_H);
-                            noteInteraction();
-                        }
-                        return true;
-                    }
+                    return true;
                 }
                 return true;
             }
@@ -1565,14 +1397,14 @@ bool ViewSettings::handleModalTouch(const TouchEvent& ev) {
                 return true;
             }
             if (ev.type != TouchEventType::Click) return true;
-            if (inRect(ev, DATE_X + 18, TIME_BTN_Y, TIME_BTN_W, MODAL_BTN_H)) {
+            if (DatePicker::hitCancel(ev)) {
                 _modal = Modal::None;
                 drawPage(M5.Display);
                 flushContentGrayscale();
                 noteInteraction();
                 return true;
             }
-            if (inRect(ev, DATE_X + DATE_W - 18 - TIME_BTN_W, TIME_BTN_Y, TIME_BTN_W, MODAL_BTN_H)) {
+            if (DatePicker::hitOk(ev)) {
                 int hh = 0, mm = 0, ss = 0, yy = 0, mo = 0, dd = 0;
                 BSP::getInstance().getLocalDateTime(yy, mo, dd, hh, mm, ss);
                 if (!BSP::getInstance().isRtcValid()) { hh = _timeH; mm = _timeM; }

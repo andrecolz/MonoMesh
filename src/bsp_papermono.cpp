@@ -1,10 +1,12 @@
 #include "bsp_papermono.h"
+#include "alarm_service.h"
 #include "clock_mode.h"
 #include "epd_driver.h"
 #include "mesh_service.h"
 #include "storage_manager.h"
 #include <esp_log.h>
 #include <esp_sleep.h>
+#include <driver/gpio.h>
 #include <driver/rtc_io.h>
 
 static constexpr const char* TAG = "MonoMesh-BSP";
@@ -12,6 +14,19 @@ static constexpr const char* TAG = "MonoMesh-BSP";
 // Shared PM1/IOE1 bus speeds: Fast Mode is attempted first, 100 kHz is the guaranteed fallback
 static constexpr uint32_t I2C_FREQ_FAST = 400000;
 static constexpr uint32_t I2C_FREQ_SAFE = 100000;
+
+namespace {
+// Program the buzzer LEDC channel. Reconfiguring the timer on every note added a small click and
+// could dip the output, so the timer is only touched when the frequency really changes (lastFreq is
+// the caller's cache, driven by BSP::_buzzerFreq).
+void writeBuzzerTone(uint16_t freqHz, uint8_t duty, uint16_t& lastFreq) {
+    if (freqHz != lastFreq) {
+        ledcSetup(0, freqHz, 8);
+        lastFreq = freqHz;
+    }
+    ledcWrite(0, duty);
+}
+} // namespace
 
 namespace MonoMesh {
 
@@ -54,9 +69,19 @@ bool BSP::init(uint8_t initialBrightness) {
     if (_pm1Ready) {
         ESP_LOGI(TAG, "M5PM1 PMIC initialized");
         _pm1.setI2cSleepTime(0);
+
+        // Latch the wake source BEFORE clearing anything: the RX8130 alarm is wired to PM1 G0, so an
+        // external-GPIO wake here means the alarm powered the board back on (AlarmService reads it).
+        uint8_t wakeSrc = 0;
+        if (_pm1.getWakeSource(&wakeSrc, M5PM1_CLEAN_ALL) == M5PM1_OK &&
+            (wakeSrc & M5PM1_WAKE_SRC_EXT_WAKE)) {
+            _bootFromRtcAlarm = true;
+            ESP_LOGI(TAG, "Boot wake source: external GPIO (RTC alarm via PM1 G0)");
+        }
+
         _pm1.irqClearGpioAll();
         _pm1.irqClearSysAll();
-        _pm1.gpioSetWakeEnable(M5PM1_GPIO_NUM_0, false);
+        _pm1.gpioSetWakeEnable(PM1Pins::RTC_INT, false);
         _pm1.gpioSetWakeEnable(M5PM1_GPIO_NUM_4, false);
 
         // Crucial for battery power hold & software button capture
@@ -233,6 +258,11 @@ void BSP::setRtcTime(int hour, int minute, int second) {
     M5.Rtc.setTime(time);
 }
 
+int BSP::getLocalWeekday() {
+    if (!M5.Rtc.isEnabled()) return 0;
+    return M5.Rtc.getDate().weekDay; // 0 = Sunday ... 6 = Saturday
+}
+
 uint32_t BSP::getRtcUnix() {
     auto dt = M5.Rtc.getDateTime();
     struct tm t = dt.get_tm();
@@ -338,7 +368,17 @@ bool BSP::checkPowerButton() {
 
 void BSP::powerOff(const char* label) {
     ESP_LOGI(TAG, "Entering Sleep / Power Off: %s", label ? label : "Power Off");
-    
+
+    // Arm the next power-wake alarm on the RX8130 before cutting the rails: the RTC /IRQ drives PM1
+    // G0, so the PMIC powers the board back on at the alarm time. A critically low cell must not be
+    // revived just to ring: below the warn threshold the arming is skipped.
+    const BatteryState bs = getBatteryState();
+    if (bs.voltageMv == 0 || bs.voltageMv > LOW_BATTERY_WARN_MV) {
+        AlarmService::getInstance().armRtcAlarm();
+    } else {
+        ESP_LOGW(TAG, "Battery %d mV: RTC alarm wake not armed on power off", bs.voltageMv);
+    }
+
     drawShutdownScreen(nullptr, nullptr, label ? label : "Power Off");
     shutdownHardware();
 }
@@ -454,6 +494,19 @@ void BSP::drawStandbyScreen() {
 
     M5.Display.display();
     M5.Display.waitDisplay();
+}
+
+// Draw (or redraw) the screen that belongs to the low-power mode currently in use: the standby logo
+// or the clock face. Called after an alarm dismiss, when the alarm name banner has to go away.
+void BSP::redrawLowPowerScreen() {
+    if (_powerMode == PowerMode::None) return;
+    const bool clock = (_powerMode == PowerMode::Clock || _powerMode == PowerMode::StandbyClock);
+    if (clock) {
+        ClockMode::getInstance().drawFace(MeshService::getInstance().getClockLandscape(),
+                                          MeshService::getInstance().getClockFlip180());
+    } else {
+        drawStandbyScreen();
+    }
 }
 
 void BSP::enterLowPower(PowerMode mode) {
@@ -586,19 +639,37 @@ void BSP::lowPowerPeripheralsOn() {
              StorageManager::getInstance().isSdMounted() ? 1 : 0);
 }
 
-esp_sleep_wakeup_cause_t BSP::lowPowerLightSleep(uint32_t maxSleepMs) {
-    // TIMER-ONLY light sleep. GPIO wake (gpio_wakeup_enable) reconfigures the pin as an RTC input and
-    // leaves a level-triggered interrupt behind: after the first transmission DIO1 stays high until
-    // the radio IRQ flags are cleared, which produced an interrupt storm on CPU1 and an Interrupt WDT
-    // panic right after the next TX. Sleeping in short slices and polling instead keeps the radio and
-    // the GPIO configuration exactly as RadioLib set them, at the cost of ~1 mA average.
-    // The radio stays in continuous RX and latches RX_DONE, so packets are read on the next poll;
-    // in the Clock mode the radio is parked and only the RTC minute change matters.
+// Arm the two user buttons as a light-sleep GPIO wake source (active low: pressed = low). The pins
+// stay plain GPIOs with their pull-ups; unlike the DIO1 trap this is armed only around the sleep and
+// disarmed immediately after, so no level-triggered interrupt can outlive the wake.
+void BSP::armButtonWake() {
+    gpio_wakeup_enable((gpio_num_t)Pins::KEY1, GPIO_INTR_LOW_LEVEL);
+    gpio_wakeup_enable((gpio_num_t)Pins::KEY2, GPIO_INTR_LOW_LEVEL);
+    esp_sleep_enable_gpio_wakeup();
+}
+
+void BSP::disarmButtonWake() {
+    gpio_wakeup_disable((gpio_num_t)Pins::KEY1);
+    gpio_wakeup_disable((gpio_num_t)Pins::KEY2);
+    esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_GPIO);
+}
+
+esp_sleep_wakeup_cause_t BSP::lowPowerLightSleep(uint32_t maxSleepMs, bool buttonWake) {
+    // TIMER-ONLY light sleep by default. GPIO wake (gpio_wakeup_enable) reconfigures the pin as an RTC
+    // input and leaves a level-triggered interrupt behind: after the first transmission DIO1 stays high
+    // until the radio IRQ flags are cleared, which produced an interrupt storm on CPU1 and an
+    // Interrupt WDT panic right after the next TX. Sleeping in short slices and polling instead keeps
+    // the radio and the GPIO configuration exactly as RadioLib set them, at the cost of ~1 mA average.
+    // The buttonWake path is the exception: the two user keys are plain GPIOs with pull-ups and are
+    // disarmed immediately after the wake, so the clock modes can sleep to the minute without losing
+    // a short tap. DIO1 is never part of it.
     esp_sleep_enable_timer_wakeup((uint64_t)maxSleepMs * 1000ULL);
+    if (buttonWake) armButtonWake();
 
     uint32_t before = millis();
     esp_err_t sleepErr = esp_light_sleep_start();
     esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+    if (buttonWake) disarmButtonWake();
     if (sleepErr != ESP_OK) {
         ESP_LOGE(TAG, "esp_light_sleep_start failed: %d (0x%x)", (int)sleepErr, (unsigned)sleepErr);
     }
@@ -671,14 +742,30 @@ void BSP::beep(uint16_t freqHz, uint16_t durationMs, BuzzerEvent ev) {
             return;
     }
 
-    ledcSetup(0, freq, 8);
-    ledcWrite(0, duty);
+    writeBuzzerTone(freq, duty, _buzzerFreq);
     _buzzerActive = true;
     _buzzerOffUntil = millis() + durationMs;
 }
 
 void BSP::click() {
     beep(0, 15, BuzzerEvent::UiClick);
+}
+
+// Alarm ringtone. Unlike beep() this ignores the buzzer mode and the volume (an alarm must always be
+// heard, and loud): the duty is always the maximum square-wave amplitude. The frequency is changed
+// without reconfiguring the LEDC timer when the note keeps the same pitch, so the output stays solid
+// through the whole pattern.
+void BSP::alarmTone(uint16_t freqHz, uint16_t durationMs) {
+    if (freqHz == 0 || durationMs == 0) return;
+    writeBuzzerTone(freqHz, 127, _buzzerFreq);
+    _buzzerActive = true;
+    _buzzerOffUntil = millis() + durationMs;
+}
+
+void BSP::stopBuzzer() {
+    ledcWrite(0, 0);
+    _buzzerActive = false;
+    _buzzerOffUntil = 0;
 }
 
 void BSP::setLedRxActivity(uint16_t durationMs) {
@@ -704,6 +791,84 @@ void BSP::syncRtcFromUnix(uint32_t unixTimestamp, int8_t tzOffsetHours) {
     ESP_LOGI(TAG, "RTC synchronized to %04d-%02d-%02d %02d:%02d:%02d via mesh packet (UTC%+d)",
              tmInfo.tm_year + 1900, tmInfo.tm_mon + 1, tmInfo.tm_mday,
              tmInfo.tm_hour, tmInfo.tm_min, tmInfo.tm_sec, (int)tzOffsetHours);
+}
+
+// ---- RTC alarm: boot from power off ----
+// The RX8130 /IRQ (alarm or timer) is wired to PM1 G0. Programming the alarm and enabling the G0
+// wake lets the PMIC power the board back on at the alarm time (same sequence as the official
+// M5Stack PaperMono demo). The alarm is cleared at boot by M5Unified (cfg.disable_rtc_irq), so the
+// line is released as soon as the board restarts.
+bool BSP::waitRtcWakeLineIdle() {
+    for (int i = 0; i < 40; ++i) { // up to 2 s
+        uint8_t level = 0;
+        if (_pm1.gpioGetInput(PM1Pins::RTC_INT, &level) == M5PM1_OK && level != 0) return true;
+        delay(50);
+    }
+    return false;
+}
+
+bool BSP::armRtcAlarmAt(int hour, int minute, int dayOfMonth, int weekDay) {
+    if (!M5.Rtc.isEnabled()) {
+        ESP_LOGW(TAG, "RTC not enabled: alarm not armed for power off");
+        return false;
+    }
+
+    // Make sure the line is released before touching the PM1 wake: a latched /IRQ would power the
+    // board straight back on.
+    _pm1.gpioSetWakeEnable(PM1Pins::RTC_INT, false);
+    M5.Rtc.disableIRQ();
+    M5.Rtc.clearIRQ();
+
+    m5::rtc_time_t t((int8_t)hour, (int8_t)minute, -1);
+    m5::rtc_date_t d;
+    if (dayOfMonth >= 1) {
+        d.date = (int8_t)dayOfMonth; // day-of-month alarm (the RX8130 has no month/year match)
+        d.weekDay = -1;
+    } else {
+        d.date = -1;
+        d.weekDay = (int8_t)(weekDay & 0x07); // weekly alarm
+    }
+    if (M5.Rtc.setAlarmIRQ(&d, &t) == 0) {
+        ESP_LOGE(TAG, "RX8130 setAlarmIRQ failed: alarm not armed");
+        return false;
+    }
+
+    if (!_pm1Ready) {
+        ESP_LOGE(TAG, "PM1 not ready: the RTC alarm cannot power the board back on");
+        return false;
+    }
+
+    _pm1.irqClearGpioAll();
+    _pm1.irqClearSysAll();
+    _pm1.irqSetGpioMask(M5PM1_IRQ_GPIO0, M5PM1_IRQ_MASK_DISABLE); // G0 asserts the PM1 IRQ pin
+    _pm1.gpioSet(PM1Pins::RTC_INT, M5PM1_GPIO_MODE_INPUT, 0, M5PM1_GPIO_PULL_UP, M5PM1_GPIO_DRIVE_PUSHPULL);
+    _pm1.gpioSetWakeEdge(PM1Pins::RTC_INT, M5PM1_GPIO_WAKE_FALLING);
+
+    if (!waitRtcWakeLineIdle()) {
+        ESP_LOGE(TAG, "RTC /IRQ line stuck low: not enabling the PM1 wake (the board would reboot at once)");
+        M5.Rtc.disableIRQ();
+        M5.Rtc.clearIRQ();
+        return false;
+    }
+
+    if (_pm1.gpioSetWakeEnable(PM1Pins::RTC_INT, true) != M5PM1_OK) {
+        ESP_LOGE(TAG, "PM1 G0 wake enable failed: the board will stay off at the alarm");
+        M5.Rtc.disableIRQ();
+        M5.Rtc.clearIRQ();
+        return false;
+    }
+
+    ESP_LOGI(TAG, "RTC alarm armed (%02d:%02d, %s) + PM1 G0 wake enabled",
+             hour, minute, (dayOfMonth >= 1) ? "day-of-month" : "weekday");
+    return true;
+}
+
+void BSP::disarmRtcAlarm() {
+    if (_pm1Ready) _pm1.gpioSetWakeEnable(PM1Pins::RTC_INT, false);
+    if (M5.Rtc.isEnabled()) {
+        M5.Rtc.disableIRQ();
+        M5.Rtc.clearIRQ();
+    }
 }
 
 void BSP::update() {

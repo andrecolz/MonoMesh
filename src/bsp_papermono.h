@@ -73,6 +73,9 @@ namespace IOEPins {
 namespace PM1Pins {
     constexpr m5pm1_gpio_num_t LORA_EN     = M5PM1_GPIO_NUM_2;
     constexpr m5pm1_gpio_num_t FRONTLIGHT  = M5PM1_GPIO_NUM_3;
+    // RX8130 /IRQ (alarm + timer output): wired to PM1 GPIO0, so the PMIC can power the board back
+    // on when the RTC alarm fires while the unit is shut down.
+    constexpr m5pm1_gpio_num_t RTC_INT     = M5PM1_GPIO_NUM_0;
 }
 
 struct BatteryState {
@@ -119,10 +122,12 @@ public:
     // is deliberately avoided because it reconfigures the pins and caused an interrupt storm on DIO1.
     // The standby slice keeps the button response instant (short taps cannot slip between polls); the
     // clock-only mode can use longer slices because nothing but the minute change and the buttons
-    // depends on the wake period.
+    // depends on the wake period. buttonWake adds the two user buttons as a GPIO wake source for that
+    // sleep (timer + buttons): used by the clock modes so a short tap is not lost between the
+    // minute-aligned slices. DIO1 is never armed this way.
     static constexpr uint32_t STANDBY_SLEEP_MS = 100;
     static constexpr uint32_t CLOCK_SLEEP_MS = 1000;
-    esp_sleep_wakeup_cause_t lowPowerLightSleep(uint32_t maxSleepMs);
+    esp_sleep_wakeup_cause_t lowPowerLightSleep(uint32_t maxSleepMs, bool buttonWake = false);
     // True while a notification beep or an LED activity pulse is still running: light sleep does not
     // stop the LEDC timer, so without this the beep/LED outlived its configured duration.
     bool hasPendingActivity() const { return _buzzerActive || _ledOffUntil > 0; }
@@ -162,6 +167,11 @@ public:
     // Buzzer (PWM on GPIO 42). The event is filtered by the buzzer mode; Test (an explicit preview
     // from the quick menu or the settings test row) is allowed by every mode except Disabled.
     void beep(uint16_t freqHz = 0, uint16_t durationMs = 50, BuzzerEvent ev = BuzzerEvent::Test);
+    // Alarm ringtone: deliberately NOT filtered by the buzzer mode and audible at volume 0 (an alarm
+    // must always be heard). Played at the maximum square-wave duty and driven from the awake CPU
+    // (the caller keeps the device out of light sleep while a note sounds).
+    void alarmTone(uint16_t freqHz, uint16_t durationMs);
+    void stopBuzzer();
     // Tono di notifica condiviso: il quick menu lo usa per l'anteprima e MeshService per i bip di
     // ricezione, così il suono in standby coincide con quello scelto dall'utente.
     static constexpr uint16_t NOTIFY_TONE_HZ = 2400;
@@ -169,6 +179,8 @@ public:
 
     BatteryState getBatteryState();
     void getRtcTime(int& hour, int& minute, int& second);
+    // 0 = Sunday ... 6 = Saturday, the same numbering the RTC register and m5::rtc_date_t use.
+    int getLocalWeekday();
     void setRtcTime(int hour, int minute, int second);
     uint32_t getRtcUnix();
     void syncRtcFromUnix(uint32_t unixTimestamp, int8_t tzOffsetHours = 1);
@@ -184,6 +196,21 @@ public:
     M5PM1& getPM1() { return _pm1; }
     M5IOE1& getIOE1() { return _ioe1; }
 
+    // ---- Alarm RTC wake (power off with a pending alarm) ----
+    // Programs the RX8130 alarm for a local wall-clock time and arms the PM1 G0 line (input,
+    // pull-up, falling edge) so a shut-down board is powered back on at the alarm. dayOfMonth >= 1
+    // selects the day-of-month alarm, otherwise the weekly alarm on weekDay (0 = Sunday).
+    // Returns false when the RTC or the PM1 could not be armed (the caller keeps normal power off).
+    bool armRtcAlarmAt(int hour, int minute, int dayOfMonth, int weekDay);
+    void disarmRtcAlarm();
+    // True when this boot was caused by the RTC alarm through PM1 G0. Latched in init(), before
+    // anything clears the PM1 wake source.
+    bool wasWokenByRtcAlarm() const { return _bootFromRtcAlarm; }
+
+    // Redraw the screen of the low-power mode currently in use (standby logo or clock face): used
+    // when the alarm banner has to be removed after a dismiss.
+    void redrawLowPowerScreen();
+
     // Idle-rail helpers used by every low-power mode: the SD rail is cut (after unmounting the FAT),
     // the touch controller stays powered (hibernating it left the panel unresponsive), while the EPD
     // rail stays on because the panel driver would otherwise lose its configuration.
@@ -197,6 +224,13 @@ private:
     void drawStandbyScreen();
     void drawShutdownScreen(const char* title, const char* subtitle, const char* bottomLabel);
     void shutdownHardware();
+    // Waits for the RX8130 /IRQ line to be released (high) before arming the PM1 wake: an asserted
+    // line would power the board straight back on right after shutdown.
+    bool waitRtcWakeLineIdle();
+    // GPIO wake on the two user buttons for the clock-mode light sleep: the level-triggered sources
+    // are disarmed right after the wake, before anything else can spin on them.
+    void armButtonWake();
+    void disarmButtonWake();
 
     M5PM1 _pm1;
     M5IOE1 _ioe1;
@@ -214,7 +248,9 @@ private:
     uint32_t _buzzerOffUntil = 0;
     uint32_t _ledOffUntil = 0;
     bool _buzzerActive = false;
+    uint16_t _buzzerFreq = 2700; // last LEDC frequency programmed (skip redundant timer reconfig)
     uint32_t _lowPowerStartMillis = 0;
+    bool _bootFromRtcAlarm = false; // PM1 G0 wake latched at init (RTC alarm power-on)
     int8_t _tzOffset = 1;   // hours east of UTC (Italy: +1 winter, +2 summer)
 };
 

@@ -33,8 +33,9 @@ public:
 
     // Complete face + full-quality refresh. landscape selects the 800x480 orientation, flip180 turns
     // the face upside down (for a device mounted the other way): both are software only on the
-    // SSD1677, nothing else on the board changes.
-    void drawFace(bool landscape, bool flip180);
+    // SSD1677, nothing else on the board changes. banner (optional) is the name of a ringing alarm,
+    // drawn above the digits; the minute partial refreshes never touch that band.
+    void drawFace(bool landscape, bool flip180, const char* banner = nullptr);
 
     // Reads the RTC and, only when the minute changed, redraws the changed digits and refreshes.
     // Cheap at every low-power wake: it is two I2C reads when nothing changed.

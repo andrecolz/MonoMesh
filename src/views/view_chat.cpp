@@ -205,11 +205,11 @@ static std::vector<std::string> wrapText(const char* text, size_t maxCharsPerLin
     return lines;
 }
 
-// Chat pagination is height-driven, not a fixed count: the bubble area runs from y=82 down to the
+// Chat pagination is height-driven, not a fixed count: the bubble area runs from y=84 down to the
 // compose bar (y=652), and each bubble is 32 + 20 px per wrapped line. Filling greedily packs as
 // many messages as physically fit (a full screen of short messages instead of a fixed 5).
 static std::vector<size_t> computeChatPageStarts(const std::vector<ChatMessage>& msgs) {
-    constexpr int TOP_Y = 82;
+    constexpr int TOP_Y = 84;
     constexpr int BOTTOM_Y = 652;
 
     std::vector<size_t> starts;
@@ -503,7 +503,7 @@ void ViewChat::drawChatMessages(M5GFX& gfx) {
         size_t startIdx = pageStarts[(size_t)(s_currentPage - 1)];
         size_t endIdx = (s_currentPage < totalPages) ? pageStarts[(size_t)s_currentPage] : msgs.size();
 
-        int curY = 82;
+        int curY = 84; // first bubble 8 px under the header line, like the conversation list cards
         for (size_t i = startIdx; i < endIdx; ++i) {
             const auto& msg = msgs[i];
             auto lines = wrapText(msg.text, BUBBLE_LINE_CHARS);

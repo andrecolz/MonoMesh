@@ -1,6 +1,9 @@
 #include "ui_engine.h"
+#include "alarm_service.h"
 #include "bsp_papermono.h"
 #include "mesh_service.h"
+#include "storage_manager.h"
+#include "views/view_alarm.h"
 #include "views/view_chat.h"
 #include "views/view_nodes.h"
 #include "views/view_map.h"
@@ -51,6 +54,25 @@ static constexpr int32_t QM_STEP_X2 = QM_BOX_X + QM_BOX_W - 66; // [+]
 static constexpr int32_t QM_STEP_Y1 = QM_ROW1_Y + 6;
 static constexpr int32_t QM_STEP_Y2 = QM_ROW2_Y + 6;
 
+// Function drawer geometry. The panel rises from the bottom and stops exactly where the first box
+// of every list starts (header line at 76 + the same 8 px gap used by the chat cards): the top
+// border lands on the top edge of the first box of the view underneath. It is the vertical mirror
+// of the quick menu: full-bleed sides, 2 px border with 18 px radius only on the open side (the top
+// here), bottom running off the screen.
+static constexpr int32_t FD_TOP = 84;
+static constexpr int32_t FD_R = 18;
+static constexpr int32_t FD_T = 2;
+// Function grid: two 222 px cells per row inside the same 452 px span used by every card (14..466),
+// so more functions fit without adding buttons to the bar. First row 8 px under the panel border
+// (the same inset the quick menu buttons use).
+static constexpr int32_t FD_COL_X = 14;
+static constexpr int32_t FD_COL_GAP = 8;
+static constexpr int32_t FD_CELL_W = (452 - FD_COL_GAP) / 2;
+static constexpr int32_t FD_CELL_H = 64;
+static constexpr int32_t FD_ROW_STEP = 72;
+static constexpr int32_t FD_ROW1_Y = FD_TOP + 8;
+static constexpr size_t FD_COLS = 2;
+
 bool UIEngine::init() {
     ESP_LOGI(TAG, "Initializing UI Engine & Views...");
 
@@ -58,9 +80,14 @@ bool UIEngine::init() {
     _views.push_back(new ViewNodes());    // View 1 (NODI)
     _views.push_back(new ViewMap());      // View 2 (MAPPA)
     _views.push_back(new ViewSettings()); // View 3 (SET)
+    _views.push_back(new ViewAlarm());    // View 4 (ALARM)
 
     _currentViewIndex = 0;
     _views[_currentViewIndex]->onEnter();
+
+    // Last-used order of the nav bar (only the drawer reorders it): kept on the SD card when one
+    // is mounted, RAM-only otherwise.
+    loadNavHistory();
 
     _needsFullRedraw = true;
     return true;
@@ -78,9 +105,9 @@ void UIEngine::setView(int viewIndex) {
 }
 
 bool UIEngine::scrollCurrentView(int8_t direction) {
-    // While the keyboard or the quick menu is on screen the physical buttons must not move the view
+    // While the keyboard or an overlay is on screen the physical buttons must not move the view
     // underneath it: the overlay is what the user is looking at.
-    if (_quickMenuOpen || _keyboardOpen) return false;
+    if (_quickMenuOpen || _keyboardOpen || _funcDrawerOpen) return false;
     if (_currentViewIndex < 0 || _currentViewIndex >= (int)_views.size()) return false;
     return _views[_currentViewIndex]->scrollPage(direction);
 }
@@ -118,6 +145,7 @@ void UIEngine::closeKeyboard() {
 }
 
 void UIEngine::openQuickMenu() {
+    if (_funcDrawerOpen) return; // the drawer owns the screen: no second overlay on top of it
     _quickMenuOpen = true;
     EPDDriver::getInstance().setRefreshMode(RefreshMode::Grayscale);
     _needsFullRedraw = true;
@@ -131,11 +159,36 @@ void UIEngine::closeQuickMenu() {
     }
 }
 
+void UIEngine::openFuncDrawer() {
+    if (_funcDrawerOpen) return;
+    _funcDrawerOpen = true;
+    _needsFullRedraw = true;
+}
+
+void UIEngine::closeFuncDrawer() {
+    if (_funcDrawerOpen) {
+        _funcDrawerOpen = false;
+        EPDDriver::getInstance().setRefreshMode(RefreshMode::Grayscale);
+        requestFullRefresh();
+    }
+}
+
 void UIEngine::update() {
     uint32_t now = millis();
 
-    // Update current active view
-    if (_currentViewIndex >= 0 && _currentViewIndex < (int)_views.size()) {
+    // An alarm started or ended ringing: the popup follows the service state. The full redraw puts
+    // the popup over the current screen (or removes it).
+    const bool ringing = AlarmService::getInstance().isRinging();
+    if (ringing != _alarmPopupOpen) {
+        _alarmPopupOpen = ringing;
+        _needsFullRedraw = true;
+    }
+
+    // Update current active view. Skipped while the function drawer is up (the panel covers the
+    // whole content area, and a view that repaints itself asynchronously (the map's settle pass)
+    // would otherwise draw over it) and while the alarm popup owns the screen.
+    if (!_funcDrawerOpen && !_alarmPopupOpen && _currentViewIndex >= 0 &&
+        _currentViewIndex < (int)_views.size()) {
         _views[_currentViewIndex]->update();
     }
 
@@ -169,6 +222,12 @@ void UIEngine::update() {
     if (TouchManager::getInstance().hasEvent()) {
         TouchEvent ev = TouchManager::getInstance().popEvent();
 
+        // 0. The alarm popup is the topmost overlay: any tap stops the alarm.
+        if (_alarmPopupOpen) {
+            handleAlarmPopupTouch(ev);
+            return;
+        }
+
         // 1. If Quick Menu is open, it consumes touch events
         if (_quickMenuOpen) {
             if (handleQuickMenuTouch(ev)) {
@@ -176,7 +235,25 @@ void UIEngine::update() {
             }
         }
 
-        // 2. Top bar click or swipe down *starting inside the top bar* opens the Quick Menu (works
+        // 2. If the function drawer is open, it consumes touch events
+        if (_funcDrawerOpen) {
+            if (handleFuncDrawerTouch(ev)) {
+                return;
+            }
+        }
+
+        // 3. Swipe up starting inside the bottom bar opens the function drawer (fast swipe or slow
+        // drag: TouchManager reports the latter as a plain Up). It is checked here, before the
+        // views, because events are routed by the release point: without this a swipe from the bar
+        // ending in the content would page the lists / pan the map.
+        if (!_keyboardOpen && ev.startY >= 730 && abs(ev.x - ev.startX) < 60 &&
+            (ev.y - ev.startY) <= -60 &&
+            (ev.type == TouchEventType::SwipeUp || ev.type == TouchEventType::Up)) {
+            openFuncDrawer();
+            return;
+        }
+
+        // 4. Top bar click or swipe down *starting inside the top bar* opens the Quick Menu (works
         // even if the keyboard is open). A swipe that starts lower down belongs to the view: on the
         // map it used to steal the gesture needed to pan the map.
         if (ev.type == TouchEventType::Click && ev.y >= 0 && ev.y < 44) {
@@ -188,13 +265,13 @@ void UIEngine::update() {
             return;
         }
 
-        // 3. If Keyboard is open, it handles touch
+        // 5. If Keyboard is open, it handles touch
         if (_keyboardOpen) {
             if (handleKeyboardTouch(ev)) {
                 return;
             }
         } else {
-            // 4. Bottom Nav Bar handles touch (Y: 730..800) only when keyboard is closed
+            // 6. Bottom Nav Bar handles touch (Y: 730..800) only when keyboard is closed
             if (!_quickMenuOpen && ev.y >= 730 && ev.y <= 800) {
                 if (handleNavBarTouch(ev)) {
                     return;
@@ -202,7 +279,7 @@ void UIEngine::update() {
             }
         }
 
-        // 5. Current active view handles touch
+        // 7. Current active view handles touch
         int viewBottomLimit = _keyboardOpen ? 430 : 730;
         if (!_quickMenuOpen && ev.y >= 44 && ev.y < viewBottomLimit) {
             if (_views[_currentViewIndex]->handleTouch(ev)) {
@@ -242,17 +319,25 @@ void UIEngine::render() {
             drawQuickMenu(gfx);
         }
 
+        if (_funcDrawerOpen) {
+            drawFuncDrawer(gfx);
+        }
+
+        if (_alarmPopupOpen) {
+            drawAlarmPopup(gfx);
+        }
+
         EPDDriver::getInstance().flush();
         return;
     }
 
-    if (_needsStatusRedraw && !_keyboardOpen && !_quickMenuOpen) {
+    if (_needsStatusRedraw && !_keyboardOpen && !_quickMenuOpen && !_funcDrawerOpen && !_alarmPopupOpen) {
         _needsStatusRedraw = false;
         drawStatusBar(gfx);
         EPDDriver::getInstance().flushRect(0, 0, 480, 44);
     }
 
-    if (_needsNavRedraw && !_keyboardOpen && !_quickMenuOpen) {
+    if (_needsNavRedraw && !_keyboardOpen && !_quickMenuOpen && !_funcDrawerOpen && !_alarmPopupOpen) {
         _needsNavRedraw = false;
         drawNavBar(gfx);
         EPDDriver::getInstance().flushRect(0, 730, 480, 70);
@@ -438,6 +523,17 @@ static void drawNavIcon(M5GFX& gfx, int index, int cx, int cy, uint16_t color, u
             drawGearIcon(gfx, cx, cy, color, bg);
             break;
         }
+        case 4: { // ALARM: clock face with bells and feet
+            gfx.drawCircle(cx, cy + 3, 12, color);
+            gfx.drawCircle(cx, cy + 3, 11, color);
+            gfx.fillRect(cx - 2, cy - 4, 4, 9, color);
+            gfx.fillRect(cx - 1, cy + 1, 7, 4, color);
+            gfx.fillCircle(cx - 10, cy - 9, 4, color);
+            gfx.fillCircle(cx + 10, cy - 9, 4, color);
+            gfx.fillRect(cx - 14, cy + 13, 6, 3, color);
+            gfx.fillRect(cx + 8, cy + 13, 6, 3, color);
+            break;
+        }
     }
 }
 
@@ -452,8 +548,8 @@ void UIEngine::drawNavBar(M5GFX& gfx) {
     int gap = 6;
 
     for (size_t i = 0; i < NUM_NAV_ITEMS; ++i) {
-        const auto& item = _navItems[i];
-        bool isActive = (item.viewIndex == _currentViewIndex);
+        const int viewIndex = _navHistory[i];
+        bool isActive = (viewIndex == _currentViewIndex);
 
         int bx = startX + i * (itemW + gap);
         // The tab we are on is drawn inverted (black background, white icon) so the current view is
@@ -465,7 +561,7 @@ void UIEngine::drawNavBar(M5GFX& gfx) {
 
         int cx = bx + itemW / 2;
         int cy = 761;
-        drawNavIcon(gfx, (int)i, cx, cy, fg, bg);
+        drawNavIcon(gfx, viewIndex, cx, cy, fg, bg);
     }
 }
 
@@ -479,7 +575,7 @@ bool UIEngine::handleNavBarTouch(const TouchEvent& ev) {
     for (size_t i = 0; i < NUM_NAV_ITEMS; ++i) {
         int bx = startX + i * (itemW + gap);
         if (ev.x >= bx && ev.x <= bx + itemW) {
-            int target = _navItems[i].viewIndex;
+            int target = _navHistory[i];
             if (target == _currentViewIndex) {
                 // Tapping the tab of the view already on screen returns to its root page (chat
                 // conversation list, settings category list).
@@ -1091,6 +1187,197 @@ bool UIEngine::handleQuickMenuTouch(const TouchEvent& ev) {
     }
 
     return true;
+}
+
+// ---------------------------------------------------------------- function drawer
+// The drawer is the vertical mirror of the quick menu: full-bleed panel hanging from FD_TOP (the
+// top edge of the first box of the lists) all the way off the bottom of the screen, with a 2 px
+// border and an 18 px radius only on the open side (the top). The straight side bands below the
+// curve are wiped, exactly like the quick menu wipes its bottom ones.
+void UIEngine::drawFuncDrawer(M5GFX& gfx) {
+    const int panelH = 800 - FD_TOP + 2 * FD_R; // bottom corners fall off-screen
+
+    gfx.fillRoundRect(0, FD_TOP, 480, panelH, FD_R, TFT_BLACK);
+    gfx.fillRoundRect(FD_T, FD_TOP + FD_T, 480 - 2 * FD_T, panelH - FD_T, FD_R - FD_T, TFT_WHITE);
+    gfx.fillRect(0, FD_TOP + FD_R + 1, FD_T, panelH - FD_R - 1, TFT_WHITE);
+    gfx.fillRect(480 - FD_T, FD_TOP + FD_R + 1, FD_T, panelH - FD_R - 1, TFT_WHITE);
+
+    // Function cells, left to right then top to bottom, in catalogue order. The function already
+    // on screen is inverted.
+    for (size_t i = 0; i < NUM_APPS; ++i) {
+        const AppEntry& app = _apps[i];
+        const int col = (int)(i % FD_COLS);
+        const int row = (int)(i / FD_COLS);
+        const int x = FD_COL_X + col * (FD_CELL_W + FD_COL_GAP);
+        const int y = FD_ROW1_Y + row * FD_ROW_STEP;
+        const bool active = (app.viewIndex == _currentViewIndex);
+        const uint16_t bg = active ? TFT_BLACK : TFT_WHITE;
+        const uint16_t fg = active ? TFT_WHITE : TFT_BLACK;
+
+        gfx.drawRoundRect(x, y, FD_CELL_W, FD_CELL_H, 6, TFT_BLACK);
+        gfx.fillRoundRect(x + 1, y + 1, FD_CELL_W - 2, FD_CELL_H - 2, 5, bg);
+        drawNavIcon(gfx, app.viewIndex, x + 34, y + FD_CELL_H / 2, fg, bg);
+
+        gfx.setTextColor(fg, bg);
+        gfx.setTextDatum(textdatum_t::middle_left);
+        gfx.setTextSize(2.5f);
+        gfx.drawString(app.label, x + 66, y + FD_CELL_H / 2);
+    }
+}
+
+bool UIEngine::handleFuncDrawerTouch(const TouchEvent& ev) {
+    // Exit gesture: the usual swipe from the left border towards the right.
+    if (isEdgeSwipeRight(ev)) {
+        closeFuncDrawer();
+        return true;
+    }
+
+    if (ev.type != TouchEventType::Click && ev.type != TouchEventType::Up) return true;
+
+    // A tap above the panel (status bar / view header stays visible) closes it.
+    if (ev.y < FD_TOP) {
+        closeFuncDrawer();
+        return true;
+    }
+
+    for (size_t i = 0; i < NUM_APPS; ++i) {
+        const int col = (int)(i % FD_COLS);
+        const int row = (int)(i / FD_COLS);
+        const int x = FD_COL_X + col * (FD_CELL_W + FD_COL_GAP);
+        const int y = FD_ROW1_Y + row * FD_ROW_STEP;
+        if (ev.x >= x && ev.x <= x + FD_CELL_W && ev.y >= y && ev.y <= y + FD_CELL_H) {
+            selectApp(i);
+            return true;
+        }
+    }
+    return true; // consume everything else while the drawer is up
+}
+
+// ---------------------------------------------------------------- alarm popup
+// Shown while an alarm rings in the normal UI: no way to miss it, and any tap stops it (the same
+// "any touch dismisses" rule the low-power path uses).
+void UIEngine::drawAlarmPopup(M5GFX& gfx) {
+    constexpr int X = 40;
+    constexpr int Y = 230;
+    constexpr int W = 400;
+    constexpr int H = 340;
+
+    gfx.fillRoundRect(X, Y, W, H, 8, TFT_WHITE);
+    gfx.drawRoundRect(X, Y, W, H, 8, TFT_BLACK);
+    gfx.drawRoundRect(X + 1, Y + 1, W - 2, H - 2, 7, TFT_BLACK);
+    gfx.fillRect(X + 2, Y + 2, W - 4, 46, TFT_BLACK);
+    gfx.setTextColor(TFT_WHITE, TFT_BLACK);
+    gfx.setTextDatum(textdatum_t::middle_center);
+    gfx.setTextSize(2.5f);
+    gfx.drawString("ALARM", X + W / 2, Y + 25);
+
+    const char* name = AlarmService::getInstance().ringingName();
+    gfx.setTextColor(TFT_BLACK, TFT_WHITE);
+    gfx.setTextSize(3);
+    gfx.drawString(name, X + W / 2, Y + 92);
+
+    int hh = 0, mm = 0, ss = 0;
+    BSP::getInstance().getRtcTime(hh, mm, ss);
+    char timeStr[8];
+    snprintf(timeStr, sizeof(timeStr), "%02d:%02d", hh, mm);
+    gfx.setTextSize(5);
+    gfx.drawString(timeStr, X + W / 2, Y + 175);
+
+    // STOP button (the whole popup is tappable, this is the affordance).
+    const int bx = X + 40;
+    const int by = Y + H - 92;
+    const int bw = W - 80;
+    const int bh = 60;
+    gfx.drawRoundRect(bx, by, bw, bh, 6, TFT_BLACK);
+    gfx.fillRoundRect(bx + 1, by + 1, bw - 2, bh - 2, 5, TFT_BLACK);
+    gfx.setTextColor(TFT_WHITE, TFT_BLACK);
+    gfx.setTextSize(3);
+    gfx.drawString("STOP", bx + bw / 2, by + bh / 2);
+}
+
+bool UIEngine::handleAlarmPopupTouch(const TouchEvent& ev) {
+    // Any touch stops the alarm; the popup consumes everything while it is up.
+    if (ev.type == TouchEventType::Down || ev.type == TouchEventType::Click ||
+        ev.type == TouchEventType::Up) {
+        AlarmService::getInstance().dismiss();
+    }
+    return true;
+}
+
+// Moves a function to the front of the bar order. A function that is not in the bar yet (the
+// catalogue is bigger than the 4 buttons) enters at the front and the least recently used one falls
+// out. Returns true when the order really changed.
+bool UIEngine::pushHistory(int viewIndex) {
+    int pos = -1;
+    for (size_t i = 0; i < NUM_NAV_ITEMS; ++i) {
+        if (_navHistory[i] == viewIndex) {
+            pos = (int)i;
+            break;
+        }
+    }
+    if (pos == 0) return false; // already in front
+    if (pos > 0) {
+        for (int i = pos; i > 0; --i) {
+            _navHistory[i] = _navHistory[i - 1];
+        }
+    } else {
+        // Not in the bar: shift everything right, the 4th entry falls out of the bar (it stays
+        // reachable from the drawer, which keeps the full catalogue).
+        for (int i = (int)NUM_NAV_ITEMS - 1; i > 0; --i) {
+            _navHistory[i] = _navHistory[i - 1];
+        }
+    }
+    _navHistory[0] = viewIndex;
+    _needsNavRedraw = true;
+    return true;
+}
+
+void UIEngine::selectApp(size_t appIndex) {
+    if (appIndex >= NUM_APPS) return;
+    const int viewIndex = _apps[appIndex].viewIndex;
+
+    // Only a pick from the drawer reorders (and persists) the bar.
+    if (pushHistory(viewIndex)) {
+        saveNavHistory();
+    }
+
+    _funcDrawerOpen = false;
+    EPDDriver::getInstance().setRefreshMode(RefreshMode::Grayscale);
+    if (viewIndex == _currentViewIndex) {
+        // Same function: reopen it at its root (conversation list / settings categories).
+        if (_currentViewIndex >= 0 && _currentViewIndex < (int)_views.size()) {
+            _views[_currentViewIndex]->resetToRoot();
+        }
+    } else {
+        setView(viewIndex);
+    }
+    _needsFullRedraw = true; // the drawer must disappear even when the view did not change
+}
+
+// Last-used bar order: a tiny text file on the SD card ("2,0,1,3"), no NVS (pure UI state). Without
+// a card the default order is kept for the session.
+void UIEngine::loadNavHistory() {
+    int order[NUM_NAV_ITEMS];
+    if (!StorageManager::getInstance().loadNavHistory(order, (int)NUM_NAV_ITEMS)) return;
+
+    // Reject duplicates / unknown ids: a hand-edited file must not leave a button blank.
+    bool seen[NUM_APPS] = {false};
+    const int viewCount = (int)_views.size();
+    for (size_t i = 0; i < NUM_NAV_ITEMS; ++i) {
+        const int v = order[i];
+        if (v < 0 || v >= viewCount || v >= (int)NUM_APPS || seen[v]) return;
+        seen[v] = true;
+    }
+    for (size_t i = 0; i < NUM_NAV_ITEMS; ++i) {
+        _navHistory[i] = order[i];
+    }
+    ESP_LOGI(TAG, "Nav bar order restored from SD: %d %d %d %d",
+             _navHistory[0], _navHistory[1], _navHistory[2], _navHistory[3]);
+}
+
+void UIEngine::saveNavHistory() const {
+    if (!StorageManager::getInstance().isSdMounted()) return;
+    StorageManager::getInstance().saveNavHistory(_navHistory, (int)NUM_NAV_ITEMS);
 }
 
 } // namespace MonoMesh

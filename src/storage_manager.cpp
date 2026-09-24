@@ -129,6 +129,15 @@ bool StorageManager::remountSd() {
     ESP_LOGI(TAG, "Remounting MicroSD after standby...");
     if (!initSdCard()) return false;
     flushNvsMessagesToSd();
+    // Alarms changed while the card was out (a one-shot disabled by the ringing alarm): the NVS
+    // blob is already up to date, rewrite the text mirror now that the FAT is back.
+    if (_alarmsFileDirty) {
+        if (saveAlarmsFile(_alarmsFileCache)) {
+            _alarmsFileDirty = false;
+            ESP_LOGI(TAG, "Alarm text mirror rewritten after standby (%u entries)",
+                     (unsigned)_alarmsFileCache.size());
+        }
+    }
     return true;
 }
 
@@ -384,6 +393,160 @@ bool StorageManager::loadSettingsFromConfigJson(SettingsConfig& cfg) {
     return gotIdentity;
 }
 
+// ---------------------------------------------------------------- alarms
+// The text mirror is the primary store when the card is mounted: one alarm per line, '|' separated,
+// name last. The on-screen keyboard has no '|' key, so no escaping is needed. Reading a file that
+// exists but is empty returns true with zero alarms: a deliberate "all deleted" state must not be
+// overridden by the NVS mirror.
+namespace {
+bool alarmRecordValid(const AlarmRecord& a) {
+    if (a.hour > 23 || a.minute > 59) return false;
+    if (a.repeat > 1 || a.tone > 2) return false;
+    if (a.repeat == 0 && (a.month < 1 || a.month > 12 || a.day < 1 || a.day > 31 ||
+                          a.year < 2023 || a.year > 2099)) {
+        return false;
+    }
+    return true;
+}
+} // namespace
+
+bool StorageManager::saveAlarmsFile(const std::vector<AlarmRecord>& alarms) {
+    if (!_sdMounted) return false;
+    File f = SD_MMC.open("/monomesh/alarms.txt", FILE_WRITE);
+    if (!f) {
+        ESP_LOGW(TAG, "Could not open /monomesh/alarms.txt for writing");
+        return false;
+    }
+    f.printf("# MonoMesh alarms: enabled|powerWake|backlight|repeat|days|year|month|day|hour|minute|tone|name\n");
+    size_t n = 0;
+    for (const auto& a : alarms) {
+        if (n++ >= MAX_ALARMS) break;
+        f.printf("%d|%d|%d|%u|%u|%u|%u|%u|%u|%u|%u|%s\n",
+                 a.enabled ? 1 : 0, a.powerWake ? 1 : 0, a.backlight ? 1 : 0, (unsigned)a.repeat,
+                 (unsigned)a.daysMask, (unsigned)a.year, (unsigned)a.month, (unsigned)a.day,
+                 (unsigned)a.hour, (unsigned)a.minute, (unsigned)a.tone, a.name);
+    }
+    f.close();
+    return true;
+}
+
+bool StorageManager::loadAlarmsFile(std::vector<AlarmRecord>& alarms) {
+    if (!_sdMounted || !SD_MMC.exists("/monomesh/alarms.txt")) return false;
+    File f = SD_MMC.open("/monomesh/alarms.txt", FILE_READ);
+    if (!f) return false;
+
+    alarms.clear();
+    while (f.available() && alarms.size() < MAX_ALARMS) {
+        String line = f.readStringUntil('\n');
+        line.trim();
+        if (line.isEmpty() || line.startsWith("#")) continue;
+
+        String fields[12];
+        int n = 0;
+        int start = 0;
+        while (n < 12) {
+            const int sep = line.indexOf('|', start);
+            if (sep < 0) {
+                fields[n++] = line.substring(start);
+                break;
+            }
+            fields[n++] = line.substring(start, sep);
+            start = sep + 1;
+        }
+        if (n != 12) {
+            ESP_LOGW(TAG, "Skipping malformed alarm line (%d fields)", n);
+            continue;
+        }
+        AlarmRecord a = {};
+        a.enabled = fields[0].toInt() != 0;
+        a.powerWake = fields[1].toInt() != 0;
+        a.backlight = fields[2].toInt() != 0;
+        a.repeat = (uint8_t)fields[3].toInt();
+        a.daysMask = (uint8_t)fields[4].toInt();
+        a.year = (uint16_t)fields[5].toInt();
+        a.month = (uint8_t)fields[6].toInt();
+        a.day = (uint8_t)fields[7].toInt();
+        a.hour = (uint8_t)fields[8].toInt();
+        a.minute = (uint8_t)fields[9].toInt();
+        a.tone = (uint8_t)fields[10].toInt();
+        strncpy(a.name, fields[11].c_str(), sizeof(a.name) - 1);
+        a.name[sizeof(a.name) - 1] = '\0';
+        if (!alarmRecordValid(a)) {
+            ESP_LOGW(TAG, "Skipping invalid alarm from SD: %02u:%02u", (unsigned)a.hour, (unsigned)a.minute);
+            continue;
+        }
+        alarms.push_back(a);
+    }
+    f.close();
+    return true;
+}
+
+bool StorageManager::saveAlarmsNvs(const std::vector<AlarmRecord>& alarms) {
+    uint8_t buf[2 + MAX_ALARMS * sizeof(AlarmRecord)] = {0};
+    buf[0] = 1; // layout version
+    const size_t n = (alarms.size() > MAX_ALARMS) ? MAX_ALARMS : alarms.size();
+    buf[1] = (uint8_t)n;
+    if (n > 0) memcpy(buf + 2, alarms.data(), n * sizeof(AlarmRecord));
+    const size_t len = 2 + n * sizeof(AlarmRecord);
+    const size_t written = _pref.putBytes("alarms", buf, len);
+    if (written != len) {
+        ESP_LOGE(TAG, "Alarm NVS write failed (%u/%u bytes): NVS full?", (unsigned)written, (unsigned)len);
+        return false;
+    }
+    return true;
+}
+
+bool StorageManager::loadAlarmsNvs(std::vector<AlarmRecord>& alarms) {
+    const size_t len = _pref.getBytesLength("alarms");
+    uint8_t buf[2 + MAX_ALARMS * sizeof(AlarmRecord)];
+    if (len < 2 || len > sizeof(buf)) return false;
+    if (_pref.getBytes("alarms", buf, len) != len) return false;
+    if (buf[0] != 1) {
+        ESP_LOGW(TAG, "Alarm NVS layout changed (v%u): ignoring the blob", (unsigned)buf[0]);
+        return false;
+    }
+    const size_t n = buf[1];
+    if (n > MAX_ALARMS || len < 2 + n * sizeof(AlarmRecord)) return false;
+    alarms.clear();
+    for (size_t i = 0; i < n; ++i) {
+        AlarmRecord a = {};
+        memcpy(&a, buf + 2 + i * sizeof(AlarmRecord), sizeof(AlarmRecord));
+        if (!alarmRecordValid(a)) continue;
+        alarms.push_back(a);
+    }
+    return true;
+}
+
+bool StorageManager::saveAlarms(const std::vector<AlarmRecord>& alarms) {
+    bool wroteSd = false;
+    if (_sdMounted) {
+        wroteSd = saveAlarmsFile(alarms);
+        if (wroteSd) _alarmsFileDirty = false;
+    }
+    if (!_sdMounted) {
+        // Remember the list so remountSd() can bring the text mirror up to date.
+        _alarmsFileDirty = true;
+        _alarmsFileCache = alarms;
+    }
+    const bool wroteNvs = saveAlarmsNvs(alarms);
+    return wroteSd || wroteNvs;
+}
+
+bool StorageManager::loadAlarms(std::vector<AlarmRecord>& alarms) {
+    alarms.clear();
+    if (_sdMounted && loadAlarmsFile(alarms)) {
+        ESP_LOGI(TAG, "Loaded %u alarm(s) from /monomesh/alarms.txt", (unsigned)alarms.size());
+        saveAlarmsNvs(alarms); // keep the cardless boot path in sync
+        return true;
+    }
+    if (loadAlarmsNvs(alarms)) {
+        ESP_LOGI(TAG, "Loaded %u alarm(s) from NVS", (unsigned)alarms.size());
+        return true;
+    }
+    ESP_LOGI(TAG, "No alarms stored");
+    return false;
+}
+
 bool StorageManager::saveSettings(const SettingsConfig& cfg) {
     // Every write is checked: the block is marked valid again only if all of them succeeded.
     bool ok = true;
@@ -510,6 +673,49 @@ bool StorageManager::loadMapView(int32_t& latE7, int32_t& lonE7, uint8_t& zoom) 
     lonE7 = _pref.getInt("mapLonI", 0);
     zoom = _pref.getUChar("mapZoom", 13);
     return (latE7 != 0 || lonE7 != 0);
+}
+
+// Nav bar order: one comma-separated line on the SD card. Written only when the user picks a
+// function from the drawer, so it costs one tiny file write per selection and zero NVS writes.
+bool StorageManager::saveNavHistory(const int* order, int count) {
+    if (!_sdMounted || !order || count <= 0) return false;
+    File f = SD_MMC.open("/monomesh/nav.txt", FILE_WRITE);
+    if (!f) {
+        ESP_LOGW(TAG, "Cannot write /monomesh/nav.txt");
+        return false;
+    }
+    char line[64];
+    int len = 0;
+    for (int i = 0; i < count && len < (int)sizeof(line) - 16; ++i) {
+        len += snprintf(line + len, sizeof(line) - len, (i == 0) ? "%d" : ",%d", order[i]);
+    }
+    f.printf("%s\n", line);
+    f.close();
+    return true;
+}
+
+bool StorageManager::loadNavHistory(int* order, int count) {
+    if (!_sdMounted || !order || count <= 0) return false;
+    if (!SD_MMC.exists("/monomesh/nav.txt")) return false;
+    File f = SD_MMC.open("/monomesh/nav.txt", FILE_READ);
+    if (!f) return false;
+    String line = f.readStringUntil('\n');
+    f.close();
+    line.trim();
+    if (line.isEmpty()) return false;
+
+    int parsed = 0;
+    int pos = 0;
+    while (parsed < count) {
+        const int comma = line.indexOf(',', pos);
+        String tok = (comma < 0) ? line.substring(pos) : line.substring(pos, comma);
+        tok.trim();
+        if (tok.isEmpty()) break;
+        order[parsed++] = tok.toInt();
+        if (comma < 0) break;
+        pos = comma + 1;
+    }
+    return parsed == count;
 }
 
 bool StorageManager::saveLearnedChannel(bool valid, uint8_t hash, const uint8_t* key, uint8_t keyLen, uint16_t hits) {
