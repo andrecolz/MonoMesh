@@ -331,6 +331,10 @@ public:
     void setPowerBtnAction(uint8_t act) { _powerBtnAction = (act <= 3) ? act : 1; }
     bool getClockLandscape() const { return _clockLandscape; }
     void setClockLandscape(bool en) { _clockLandscape = en; }
+    // Map view theme. Containers are always stored in the light style: the dark
+    // palette is applied by the renderer at runtime (FLAG_DARK is ignored).
+    bool getMapDarkTheme() const { return _mapDarkTheme; }
+    void setMapDarkTheme(bool en) { _mapDarkTheme = en; }
     bool getClockFlip180() const { return _clockFlip180; }
     void setClockFlip180(bool en) { _clockFlip180 = en; }
     // Broadcast intervals (seconds). 0 = disabled for position/NeighborInfo; NodeInfo and telemetry
@@ -408,6 +412,7 @@ private:
     uint8_t _powerBtnAction = 1; // 0=PowerOff, 1=Standby, 2=Clock, 3=Standby+Clock (default Standby)
     bool _clockLandscape = true; // clock face orientation (default landscape)
     bool _clockFlip180 = false;  // clock face upside down (180°, for an inverted wall mount)
+    bool _mapDarkTheme = false;  // map view: inverted palette (device setting)
     uint8_t _dutyCyclePct = 0;   // 0 = region default, 100 = override (no limit)
     RebroadcastMode _rebroadcastMode = RebroadcastMode::All;
     // True while the SX1262 is parked in sleep by the CLOCK power mode: no radio register may be

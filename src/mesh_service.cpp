@@ -435,6 +435,7 @@ bool MeshService::init() {
         // 0..3 = PowerOff/Standby/Clock/Standby+Clock; anything else (stale blob) falls back to Standby
         _powerBtnAction = (cfg.powerBtnAction <= 3) ? cfg.powerBtnAction : 1;
         _clockLandscape = cfg.clockLandscape;
+        _mapDarkTheme = cfg.mapDarkTheme;
         _clockFlip180 = cfg.clockFlip180;
         _nodeRole = static_cast<NodeRole>(cfg.nodeRole);
         _nodeInfoIntervalSec = cfg.nodeInfoIntervalSec > 0 ? cfg.nodeInfoIntervalSec : 10800;
@@ -4208,6 +4209,7 @@ void MeshService::saveConfig(bool withNodes) {
     cfg.powerBtnAction = _powerBtnAction;
     cfg.antiGhostThreshold = _antiGhostThreshold;
     cfg.clockLandscape = _clockLandscape;
+    cfg.mapDarkTheme = _mapDarkTheme;
     cfg.clockFlip180 = _clockFlip180;
     cfg.nodeRole = static_cast<uint8_t>(_nodeRole);
     cfg.nodeInfoIntervalSec = _nodeInfoIntervalSec;

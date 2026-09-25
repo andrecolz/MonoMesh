@@ -41,6 +41,7 @@ private:
 public:
     static constexpr size_t kMaxScratch = 32 * 1024;   // largest compressed tile accepted
     static constexpr size_t kIndexPsramLimit = 1536 * 1024;
+    static constexpr size_t kEntryCacheEntries = 512;  // 4 KB window, see tileAt()
 
     ~MapPack();
 
@@ -51,7 +52,6 @@ public:
     const std::string& name() const { return _name; }
     const std::string& attribution() const { return _attribution; }
     const std::string& path() const { return _path; }
-    bool dark() const { return _dark; }
     uint16_t tilePx() const { return _tilePx; }
     size_t zoomCount() const { return _zooms.size(); }
     const ZoomInfo* zoomAt(size_t i) const { return i < _zooms.size() ? &_zooms[i].info : nullptr; }
@@ -67,8 +67,6 @@ public:
     int selectedZoom() const { return _sel ? (int)_sel->info.z : -1; }
     uint8_t selectedBits() const { return _selBits; }
     size_t packedTileBytes() const;
-    // Tiles that carry no payload are filled with black in a dark style.
-    bool blankIsBlack() const { return _dark; }
 
     // Tile access for the currently selected zoom.
     bool tileAt(int x, int y, uint32_t& offset, uint16_t& length, uint16_t& flags) const;
@@ -76,6 +74,15 @@ public:
     // Returns false for a blank tile or on any error, so the caller paints the
     // background instead of garbage.
     bool readTile(int x, int y, uint8_t* out, size_t outCap, size_t& outLen);
+
+    // Tile access for any zoom without selecting it: the overzoom fallback in
+    // the view walks parent levels while the current zoom stays selected, so a
+    // coverage edge does not reload the whole index once per tile.  These use
+    // small on-demand reads, they are not on the panning hot path.
+    uint8_t zoomBits(int z) const;
+    bool tileAtZoom(int z, int x, int y, uint32_t& offset, uint16_t& length,
+                    uint16_t& flags) const;
+    bool readTileZoom(int z, int x, int y, uint8_t* out, size_t outCap, size_t& outLen);
 
     // Geographic bounds of the selected zoom's tile grid ("find my maps" without
     // touching the filesystem) and the centre of the covered area in tile units.
@@ -89,12 +96,12 @@ private:
     bool loadIndex(const ZoomRec& rec);
     void releaseIndex();
     void setError(const char* msg);
+    const ZoomRec* findZoomRec(int z) const;
 
     mutable File _file;   // tileAt() is const but has to read entries from the SD
     std::string _path, _name, _attribution, _error;
     uint16_t _tilePx = 256;
     uint8_t _bits = 1;
-    bool _dark = false;
     std::vector<ZoomRec> _zooms;
 
     const ZoomRec* _sel = nullptr;
@@ -103,6 +110,15 @@ private:
     uint32_t* _prefix = nullptr;
     uint8_t* _index = nullptr;    // nullptr => entries are read from the SD on demand
     size_t _indexCount = 0;
+    // Small window of the on-SD entry table: panning walks consecutive ranks, so
+    // one 4 KB read serves hundreds of tile lookups. mutable because tileAt() is
+    // const but has to refill the window.
+    mutable uint8_t* _entryCache = nullptr;
+    mutable uint32_t _entryCacheFirst = 0;
+    mutable uint16_t _entryCacheCount = 0;
+#ifdef MONOMESH_MAP_CACHE_DEBUG
+    mutable uint32_t _cacheHits = 0, _cacheMisses = 0;
+#endif
     uint8_t* _scratch = nullptr;
     size_t _scratchCap = 0;
     // tinfl_decompressor*, heap allocated: the ROM helper keeps this ~6 KB state

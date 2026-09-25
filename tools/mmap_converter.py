@@ -10,10 +10,14 @@ Features:
 - Smart Caching: Saves extracted area vectors in a compact binary cache
 - Authentic Toner Style: White land, black water, hierarchic roads with casing,
   and town/city labels with protective white halo for E-Paper display.
+- Seamless labels: the label contest runs once per zoom over the whole surface,
+  so a name anchored near a tile border is drawn whole on both tiles instead of
+  being cut at the seam.
 - Parallel rendering: one worker per CPU core (multiprocessing)
 - Fast path renderer: ways are bucketed per tile once per zoom, so each tile
   only touches the geometry it actually shows.
-- Off-grid tricks that keep the output pixel-identical but cut the work:
+- Off-grid tricks that keep the rest of the output pixel-identical but cut the
+  work (labels near a border are the one intentional difference):
   * the projection only touches the ways the requested zooms can draw, and the
     per-way bounding box is measured once for all of them instead of once per
     zoom (the tile index of a z9-11 run costs a fourth of what it did);
@@ -46,8 +50,10 @@ never written while rendering, so the workers share them with no page churn.
 The pipeline also builds one compact index per zoom and drops it right after
 that zoom is rendered, and releases the vector cache before forking.
 
-The container is not byte-reproducible: the payloads are laid out in the order
-the workers finish, which varies between runs.  The tiles themselves are.
+The container is byte-reproducible: the payloads are rewritten row-major at
+close(), so the same tiles produce the same file whatever order the workers
+finish in, and neighbouring tiles stay adjacent on the SD card.  merge() in
+mono_map.py copies those payloads verbatim into a bigger region.
 
 The rendering engine is designed to be bit-identical to the legacy one; the
 legacy implementation is kept as ``render_toner_tile_reference`` and used by the
@@ -61,6 +67,7 @@ import time
 import gzip
 import json
 import glob
+import io
 import struct
 import zlib
 import argparse
@@ -1235,7 +1242,7 @@ class TileIndex:
 
     __slots__ = ("zoom", "xs", "ys", "scale", "x0", "y0", "nx", "ny",
                  "tile_offsets", "tile_items", "way_off", "way_code", "way_width",
-                 "way_casing", "way_cls", "way_blk", "place_buckets",
+                 "way_casing", "way_cls", "way_blk", "label_buckets",
                  "blk_min_x", "blk_max_x", "blk_min_y", "blk_max_y")
 
     def __init__(self, zoom, xs=None, ys=None, scale=1.0, x0=0, y0=0, nx=0, ny=0):
@@ -1255,7 +1262,7 @@ class TileIndex:
         self.way_casing = None
         self.way_cls = None
         self.way_blk = None
-        self.place_buckets = {}
+        self.label_buckets = {}
         # Per-block bounding boxes of the long ways (see build_tile_index).
         self.blk_min_x = None
         self.blk_max_x = None
@@ -1611,14 +1618,13 @@ def build_tile_index(data, z, locations=None, boxes=None, way_off=None):
     index.blk_min_y = blk_min_y
     index.blk_max_y = blk_max_y
 
+    # Labels are placed once for the whole zoom surface (see place_labels): the
+    # old per-tile buckets were the reason a name crossing a border was cut.
     inv_e5 = 1.0 / E5
-    for i in range(data.n_places):
-        lat = data.place_lat_e5[i] * inv_e5
-        lon = data.place_lon_e5[i] * inv_e5
-        tx = int(math.floor(world_x(lat, lon, n)))
-        ty = int(math.floor(world_y(lat, lon, n)))
-        entry = (lat, lon, data.place_kind[i], data.place_names[i], data.place_population[i])
-        index.place_buckets.setdefault((tx, ty), []).append(entry)
+    index.label_buckets = place_labels(
+        [(data.place_lat_e5[i] * inv_e5, data.place_lon_e5[i] * inv_e5,
+          data.place_kind[i], data.place_names[i], data.place_population[i])
+         for i in range(data.n_places)], z)
 
     return index
 
@@ -1789,15 +1795,27 @@ def _visible_span(index, blk, off, cnt, tx, ty, scale):
     return j0, j1
 
 
-def render_tile_image(z, tx, ty, index, style_dark=False):
+def tile_is_blank(index, tx, ty):
+    """True when a tile is guaranteed white: no geometry and no label.
+
+    Labels may bleed in from a neighbour (see place_labels), so an empty
+    geometry span alone is not enough: the tile must have no label record
+    either.  Nothing would be drawn, so the pipeline can skip Pillow and emit
+    the blank record directly (see _render_one).
+    """
+    start, end = index.tile_span(tx, ty)
+    return start == end and not index.label_buckets.get((tx, ty))
+
+
+def render_tile_image(z, tx, ty, index):
     """Renders one 256x256 Toner tile and returns the PIL image (mode "L").
 
     Keeping the raster and the encoding separate is what lets the same renderer
     feed either PNG files or the packed .mmap container: the container writer
-    works on this image, so a different style only changes the pixels.
+    works on this image, and the dark theme is applied by the device at runtime.
     """
-    bg_color = 0 if style_dark else 255
-    fg_color = 255 if style_dark else 0
+    bg_color = 255
+    fg_color = 0
     im = Image.new("L", (256, 256), bg_color)
     draw = ImageDraw.Draw(im)
 
@@ -1840,13 +1858,13 @@ def render_tile_image(z, tx, ty, index, style_dark=False):
             _draw_way(draw, z, way_code[widx], way_width[widx],
                       way_casing[widx], px_pts, fg_color, bg_color)
 
-    draw_labels(draw, z, tx, ty, index.place_buckets.get((tx, ty), ()), fg_color, bg_color)
+    draw_labels_for_tile(draw, z, index.label_buckets.get((tx, ty), ()), fg_color, bg_color)
     return im
 
 
-def render_tile_fast(z, tx, ty, index, output_path, style_dark=False, save_kwargs=None):
+def render_tile_fast(z, tx, ty, index, output_path, save_kwargs=None):
     """Renders one 256x256 Toner tile and writes it as a PNG file."""
-    im = render_tile_image(z, tx, ty, index, style_dark=style_dark)
+    im = render_tile_image(z, tx, ty, index)
     opts = save_kwargs or {}
     if opts.get("bits") == 1:
         dither = getattr(Image, "Dither", None)
@@ -1903,12 +1921,30 @@ def _boxes_overlap(a, b, pad=1):
                 a[3] + pad <= b[1] or b[3] + pad <= a[1])
 
 
-def draw_labels(draw, z, tx, ty, entries, fg_color, bg_color):
-    """Places the most important labels that fit, without overlaps.
+# Text metrics do not depend on the target image: one throw-away draw sizes
+# every label box during the global placement (see place_labels).
+_LABEL_MEASURE = ImageDraw.Draw(Image.new("L", (1, 1)))
 
-    The reference Toner style only shows a handful of labels per tile and drops
-    the ones that would collide; without this a low zoom tile ends up covered in
-    overlapping names.
+
+def _box_tiles(box):
+    """Tiles overlapped by a global pixel box (see :func:`place_labels`)."""
+    for ty in range(box[1] // 256, (box[3] - 1) // 256 + 1):
+        for tx in range(box[0] // 256, (box[2] - 1) // 256 + 1):
+            yield (tx, ty)
+
+
+def place_labels(entries, z):
+    """Places the labels of one zoom in global pixel space, once for all tiles.
+
+    The per-tile version of this contest used to cut a name that crossed a tile
+    border at the seam.  Running it on the whole zoom surface keeps the same
+    rules (greedy by population, per-window budget, no overlapping boxes) but
+    makes the outcome global: a label is then reported on every tile its box
+    overlaps, with local pixel coordinates that may be negative (Pillow clips
+    the drawing, so the name stays whole across the border).
+
+    ``entries`` is an iterable of ``(lat, lon, kind, name[, population])``.
+    Returns ``{(tile_x, tile_y): [(px, py, kind, name), ...]}``.
     """
     kinds = zoom_label_kinds(z)
     budget = label_budget(z)
@@ -1918,35 +1954,76 @@ def draw_labels(draw, z, tx, ty, entries, fg_color, bg_color):
         population = entry[4] if len(entry) > 4 else 0
         if kind not in kinds or not name:
             continue
-        candidates.append((place_score(kind, population), lat, lon, kind, name))
+        candidates.append((place_score(kind, population), name, lat, lon, kind))
     if not candidates:
-        return
-    candidates.sort(key=lambda e: -e[0])
+        return {}
+    # Name breaks the score ties: the same data must place the same labels even
+    # when two places share a population (or their kind's default score).
+    candidates.sort(key=lambda e: (-e[0], e[1]))
 
     n = 2.0 ** z
-    placed = []
-    for _score, lat, lon, kind, name in candidates:
-        if len(placed) >= budget:
-            break
+    placed_boxes = {}   # {(tx, ty): [global box, ...]}, for cheap overlap tests
+    per_window = {}     # {(tx, ty): placed count}, the _LABEL_BUDGET per 256px tile
+    out = {}
+    for _score, name, lat, lon, kind in candidates:
         font, dot_r = label_font(kind, z)
         if font is None:
             continue
-        px = int(round((world_x(lat, lon, n) - tx) * 256.0))
-        py = int(round((world_y(lat, lon, n) - ty) * 256.0))
+        wx = world_x(lat, lon, n)
+        wy = world_y(lat, lon, n)
+        ax = int(math.floor(wx))
+        ay = int(math.floor(wy))
+        if per_window.get((ax, ay), 0) >= budget:
+            continue
+        px = int(round((wx - ax) * 256.0))
+        py = int(round((wy - ay) * 256.0))
         x = px + dot_r + 3
         y = py - 6
         try:
-            tb = draw.textbbox((x, y), name, font=font, stroke_width=2)
+            tb = _LABEL_MEASURE.textbbox((x, y), name, font=font, stroke_width=2)
         except Exception:  # pragma: no cover - very old Pillow
             tb = (x, y, x + 9 * len(name), y + 14)
-        box = (tb[0], tb[1], tb[2], tb[3])
-        if box[2] < 0 or box[0] > 256 or box[3] < 0 or box[1] > 256:
+        box = (ax * 256 + tb[0], ay * 256 + tb[1],
+               ax * 256 + tb[2], ay * 256 + tb[3])
+        if any(_boxes_overlap(box, b)
+               for key in _box_tiles(box) for b in placed_boxes.get(key, ())):
             continue
-        if any(_boxes_overlap(box, b) for b in placed):
+        for key in _box_tiles(box):
+            placed_boxes.setdefault(key, []).append(box)
+        per_window[(ax, ay)] = per_window.get((ax, ay), 0) + 1
+        # The dot belongs to the label as well: an anchor at the very edge can
+        # leave the text box in the next tile and still have the dot here, so
+        # the tile assignment follows the union of both.
+        dot = (ax * 256 + px - dot_r, ay * 256 + py - dot_r,
+               ax * 256 + px + dot_r + 1, ay * 256 + py + dot_r + 1)
+        cover = (min(box[0], dot[0]), min(box[1], dot[1]),
+                 max(box[2], dot[2]), max(box[3], dot[3]))
+        for tx, ty in _box_tiles(cover):
+            out.setdefault((tx, ty), []).append(
+                (px - (tx - ax) * 256, py - (ty - ay) * 256, kind, name))
+    return out
+
+
+def draw_labels_for_tile(draw, z, labels, fg_color, bg_color):
+    """Draws the placed labels (see :func:`place_labels`) into one tile."""
+    for px, py, kind, name in labels:
+        font, dot_r = label_font(kind, z)
+        if font is None:
             continue
-        placed.append(box)
+        x = px + dot_r + 3
+        y = py - 6
         draw.ellipse([(px - dot_r, py - dot_r), (px + dot_r, py + dot_r)], fill=fg_color)
         draw.text((x, y), name, fill=fg_color, font=font, stroke_width=2, stroke_fill=bg_color)
+
+
+def draw_labels(draw, z, tx, ty, entries, fg_color, bg_color):
+    """Per-tile helper (kept for compatibility / tests).
+
+    Places the given entries globally and draws the ones that touch this tile,
+    so it behaves exactly like the renderer does.
+    """
+    draw_labels_for_tile(draw, z, place_labels(entries, z).get((tx, ty), ()),
+                         fg_color, bg_color)
 
 
 def draw_place_label(draw, z, tx, ty, entry, fg_color, bg_color):
@@ -1954,15 +2031,15 @@ def draw_place_label(draw, z, tx, ty, entry, fg_color, bg_color):
     draw_labels(draw, z, tx, ty, [entry], fg_color, bg_color)
 
 
-def render_toner_tile_reference(z, tx, ty, ways, places, output_path, style_dark=False):
+def render_toner_tile_reference(z, tx, ty, ways, places, output_path):
     """
     Straightforward (slow) renderer used as the oracle of the test-suite: it
     must apply exactly the same style rules as the fast path, and the fast path
     must reproduce it pixel for pixel.
     """
     n = 2.0 ** z
-    bg_color = 0 if style_dark else 255
-    fg_color = 255 if style_dark else 0
+    bg_color = 255
+    fg_color = 0
 
     im = Image.new("L", (256, 256), bg_color)
     draw = ImageDraw.Draw(im)
@@ -2011,19 +2088,13 @@ def render_toner_tile_reference(z, tx, ty, ways, places, output_path, style_dark
                 if is_casing and width >= 3:
                     draw.line(px_pts, fill=bg_color, width=width - 2, joint="curve")
 
-    # 4. labels
-    entries = []
-    for p in places:
-        lat, lon = p["lat"], p["lon"]
-        # a label belongs to the tile that contains its anchor (same rule the
-        # fast path applies when it builds the per tile buckets)
-        if int(math.floor(world_x(lat, lon, n))) != tx:
-            continue
-        if int(math.floor(world_y(lat, lon, n))) != ty:
-            continue
-        entries.append((lat, lon, PLACE_KIND_IDX.get(p["type"], 255),
-                        p["name"], p.get("population", 0)))
-    draw_labels(draw, z, tx, ty, entries, fg_color, bg_color)
+    # 4. labels: the same global placement the fast path builds in the index,
+    # so a name that bleeds over a tile border lands on the same pixels in both
+    # renderers.
+    entries = [(p["lat"], p["lon"], PLACE_KIND_IDX.get(p["type"], 255),
+                p["name"], p.get("population", 0)) for p in places]
+    draw_labels_for_tile(draw, z, place_labels(entries, z).get((tx, ty), ()),
+                         fg_color, bg_color)
 
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     im.save(output_path, format="PNG", optimize=True)
@@ -2075,11 +2146,34 @@ def save_kwargs_for(png_mode):
 _WORKER_STATE = {}
 
 
-def _worker_init(index, save_kwargs, style_dark, output_dir, mode="png", bits=1,
+_BLANK_PNG_CACHE = {}
+
+
+def blank_png_bytes(save_kwargs):
+    """PNG bytes of a solid white 256x256 tile for the given save options.
+
+    A blank tile used to be rasterised (an all-white image) and then encoded;
+    the result is a constant per option set, so it is cached and reused instead
+    of paying Pillow for the same bytes a million times on a whole-PBF run.
+    """
+    key = tuple(sorted(save_kwargs.items()))
+    data = _BLANK_PNG_CACHE.get(key)
+    if data is None:
+        out_im = Image.new("L", (256, 256), 255)
+        if save_kwargs.get("bits") == 1:
+            dither = getattr(Image, "Dither", None)
+            out_im = out_im.convert("1", dither=getattr(dither, "NONE", 0) if dither else 0)
+        buf = io.BytesIO()
+        out_im.save(buf, format="PNG", **save_kwargs)
+        data = buf.getvalue()
+        _BLANK_PNG_CACHE[key] = data
+    return data
+
+
+def _worker_init(index, save_kwargs, output_dir, mode="png", bits=1,
                  deflate_level=6):
     _WORKER_STATE["index"] = index
     _WORKER_STATE["save_kwargs"] = save_kwargs
-    _WORKER_STATE["style_dark"] = style_dark
     _WORKER_STATE["out"] = output_dir
     _WORKER_STATE["mode"] = mode
     _WORKER_STATE["bits"] = bits
@@ -2105,29 +2199,37 @@ def _render_one(task):
     mode = state.get("mode", "png")
 
     t0 = time.perf_counter()
-    im = render_tile_image(z, tx, ty, index, style_dark=state["style_dark"])
+    is_blank = tile_is_blank(index, tx, ty)
+    im = None if is_blank else render_tile_image(z, tx, ty, index)
     t1 = time.perf_counter()
 
     png_bytes = 0
     if mode in ("png", "both"):
         path = os.path.join(state["out"], str(z), str(tx), f"{ty}.png")
         opts = state["save_kwargs"]
-        out_im = im
-        if opts.get("bits") == 1:
-            dither = getattr(Image, "Dither", None)
-            out_im = out_im.convert("1", dither=getattr(dither, "NONE", 0) if dither else 0)
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        out_im.save(path, format="PNG", **opts)
+        if is_blank:
+            with open(path, "wb") as fh:
+                fh.write(blank_png_bytes(opts))
+        else:
+            out_im = im
+            if opts.get("bits") == 1:
+                dither = getattr(Image, "Dither", None)
+                out_im = out_im.convert("1", dither=getattr(dither, "NONE", 0) if dither else 0)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            out_im.save(path, format="PNG", **opts)
         png_bytes = os.path.getsize(path)
     t2 = time.perf_counter()
 
     packed = None
     blank = 0
     if mode in ("mmap", "both"):
-        bits = state["bits"]
-        raw = pack_tile_image(im, 256, bits, dither=(bits == 2))
-        blank = blank_kind(raw)
-        packed = b"" if blank else zlib.compress(raw, state["deflate_level"])
+        if is_blank:
+            packed, blank = b"", 1
+        else:
+            bits = state["bits"]
+            raw = pack_tile_image(im, 256, bits, dither=(bits == 2))
+            blank = blank_kind(raw)
+            packed = b"" if blank else zlib.compress(raw, state["deflate_level"])
     t3 = time.perf_counter()
 
     return (z, tx, ty, png_bytes, packed, blank,
@@ -2210,7 +2312,7 @@ def load_or_extract(pbf_path, bbox, area_name, cache_dir=None, force=False, verb
 
 
 def generate_tiles_from_pbf(pbf_path, min_lat, min_lon, max_lat, max_lon, zoom_levels,
-                            output_dir="./tiles", area_name="area", style_dark=False,
+                            output_dir="./tiles", area_name="area",
                             force=False, jobs=None, png_mode="fast", cache_dir=None,
                             keep_existing=True, verbose=True, out_format="png",
                             mmap_out=None, bits=1, deflate_level=6, benchmark=False,
@@ -2318,13 +2420,22 @@ def generate_tiles_from_pbf(pbf_path, min_lat, min_lon, max_lat, max_lon, zoom_l
     save_kwargs = save_kwargs_for(png_mode)
     worker_mode = out_format if out_format in ("png", "mmap", "both") else "png"
 
+    # Grid hints for the writer: a zoom's tiles are exactly the range the bbox
+    # enumerates, so the writer can use flat arrays instead of a dict of ~1.35M
+    # tuples (the peak memory of a whole-PBF run).
+    tile_grids = {}
+    for z in needed_zooms:
+        gx0, gx1, gy0, gy1 = tile_range(bbox, z)
+        tile_grids[z] = (gx0, gy0, gx1 - gx0 + 1, gy1 - gy0 + 1)
+
     writer = None
     mmap_target = ""
     if use_mmap:
         mmap_target = mmap_out or os.path.join(output_dir, f"{area_name}.mmap")
         os.makedirs(os.path.dirname(os.path.abspath(mmap_target)) or ".", exist_ok=True)
         writer = MapWriter(mmap_target, bits=bits, tile_px=256, name=area_name,
-                           bbox=bbox, dark=style_dark, deflate_level=deflate_level)
+                           bbox=bbox, deflate_level=deflate_level,
+                           tile_grids=tile_grids)
         # Place index: enables on-device search and label work later on, costs
         # ~20 bytes per place plus the names blob (68k places for the whole
         # north-west PBF: skip it with --no-poi if size matters more than that).
@@ -2377,7 +2488,7 @@ def generate_tiles_from_pbf(pbf_path, min_lat, min_lon, max_lat, max_lon, zoom_l
         time instead of the whole zoom pyramid at once.
         """
         idx = index[z]
-        _worker_init(idx, save_kwargs, style_dark, output_dir, worker_mode, bits,
+        _worker_init(idx, save_kwargs, output_dir, worker_mode, bits,
                      deflate_level)
         if jobs > 1 and len(tiles) > 3:
             try:
@@ -2392,7 +2503,7 @@ def generate_tiles_from_pbf(pbf_path, min_lat, min_lon, max_lat, max_lon, zoom_l
                 pool_ctx = ctx.Pool(processes=jobs)
             else:  # pragma: no cover - non-fork platforms
                 pool_ctx = ctx.Pool(processes=jobs, initializer=_worker_init,
-                                    initargs=(idx, save_kwargs, style_dark, output_dir,
+                                    initargs=(idx, save_kwargs, output_dir,
                                               worker_mode, bits, deflate_level))
             with pool_ctx as pool:
                 if use_rich_progress:
@@ -2487,6 +2598,8 @@ def generate_tiles_from_pbf(pbf_path, min_lat, min_lon, max_lat, max_lon, zoom_l
         parts.append(f"    Copy '{os.path.basename(mmap_target)}' (a single file) into the /maps folder of the MicroSD:")
         parts.append("    Final path on MicroSD: /sdcard/maps/<region>.mmap")
     parts += [
+        "",
+        "    Theme (light/dark) is a setting of the device, not of the container.",
         "",
         "[*] Legal notes / Attribution:",
         "    Map data: © OpenStreetMap contributors (ODbL)",
@@ -2668,14 +2781,7 @@ def run_tui():
         if not zooms:
             print("[!] Enter comma separated zoom levels (e.g. 12,13,14).")
 
-    # 4. Style
-    print("\nToner Style:")
-    print("  [1] Pure Toner B/W (E-Paper recommended - white background, black roads/water)")
-    print("  [2] Inverted Toner Dark (black background, white roads)")
-    st_choice = input("Style choice [1..2, default: 1]: ").strip() or "1"
-    style_dark = (st_choice == "2")
-
-    # 5. Performance options
+    # 4. Performance options
     default_jobs = max(1, (os.cpu_count() or 2) - 1)
     jobs_str = input(f"\nParallel processes [default: {default_jobs}, 1 = serial]: ").strip()
     try:
@@ -2698,6 +2804,15 @@ def run_tui():
     force_choice = input("Overwrite existing tiles if present? (y/N): ").strip().lower()
     force = force_choice in ("y", "yes")
 
+    # Pointers that matter once a first container exists: merging regions and a
+    # global fallback are one command away, but their tools stay CLI-only.
+    existing = glob.glob(os.path.join(out_dir, "*.mmap"))
+    if existing:
+        print(f"\n[i] {len(existing)} container(s) already in {out_dir}.")
+        print("    To merge several regions into one file: "
+              "python3 tools/mono_map.py merge out.mmap in1.mmap in2.mmap")
+    print("[i] Global z0-7 courtesy coverage: python3 tools/basemap_generator.py")
+
     plan = tile_plan((min_lat, min_lon, max_lat, max_lon), zooms, bits=bits)
     print_tile_plan(plan, jobs, out_format, bits, whole_pbf=whole_pbf,
                     bbox=(min_lat, min_lon, max_lat, max_lon))
@@ -2716,7 +2831,6 @@ def run_tui():
         zoom_levels=zooms,
         output_dir=out_dir,
         area_name=area_name,
-        style_dark=style_dark,
         force=force,
         jobs=jobs,
         png_mode=png_mode,
@@ -2739,7 +2853,8 @@ def main():
     parser.add_argument("--bbox", nargs=4, type=float, metavar=("MIN_LAT", "MIN_LON", "MAX_LAT", "MAX_LON"),
                         help="Bounding box: min_lat min_lon max_lat max_lon")
     parser.add_argument("--zooms", type=str, default="12,13,14", help="Comma-separated zoom levels (default: 12,13,14)")
-    parser.add_argument("--dark", action="store_true", help="Dark / inverted Toner style")
+    parser.add_argument("--dark", action="store_true",
+                        help="Deprecated: ignored (the dark theme is a device setting now)")
     parser.add_argument("--output", type=str, default=None,
                         help="Destination folder (default: ./maps for a .mmap container, ./tiles for PNG)")
     parser.add_argument("--force", action="store_true", help="Force regeneration (ignore cache and existing tiles)")
@@ -2768,6 +2883,10 @@ def main():
     parser.add_argument("--quiet", action="store_true", help="Reduce output")
 
     args = parser.parse_args()
+
+    if args.dark:
+        print("[!] --dark is deprecated and ignored: the dark theme is now a runtime "
+              "setting on the device.")
 
     # Options that belong to the other output format: say it out loud instead of
     # silently ignoring them (the .mmap has its own encoding, the PNGs have theirs).
@@ -2851,7 +2970,6 @@ def main():
         zoom_levels=zooms,
         output_dir=out_dir,
         area_name=area_name,
-        style_dark=args.dark,
         force=args.force,
         jobs=args.jobs,
         png_mode=args.png_mode,

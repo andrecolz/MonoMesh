@@ -93,7 +93,9 @@ import struct
 import sys
 import tempfile
 import time
+import warnings
 import zlib
+from array import array
 
 MAGIC = b"MONOMMAP"
 VERSION = 1
@@ -266,8 +268,9 @@ def pack_tile_image(im, tile_px: int = 256, bits: int = 1, dither: bool = True,
     if im.mode != "L":
         im = im.convert("L")
     if bits == 1:
-        return im.point(lambda v: 255 if v >= 128 else 0).convert(
-            "1", dither=Image.Dither.NONE).tobytes()
+        # Dither disabled, Pillow's own "1" conversion thresholds at 128: the
+        # same values the explicit point() pass used to produce.
+        return im.convert("1", dither=Image.Dither.NONE).tobytes()
     if bits != 2:
         raise ValueError("bits must be 1 or 2")
 
@@ -331,12 +334,124 @@ def blank_kind(payload: bytes) -> int:
 # --------------------------------------------------------------------------- #
 # Writer
 # --------------------------------------------------------------------------- #
+class _DictTiles:
+    """Tile storage used when the writer has no grid hint for a zoom."""
+
+    __slots__ = ("cells",)
+
+    def __init__(self):
+        self.cells = {}
+
+    def get(self, x, y):
+        return self.cells.get((x, y))
+
+    def put(self, x, y, entry):
+        self.cells[(x, y)] = entry
+
+    def __len__(self):
+        return len(self.cells)
+
+    def grid(self):
+        xs = [k[0] for k in self.cells]
+        ys = [k[1] for k in self.cells]
+        x0, x1 = min(xs), max(xs)
+        y0, y1 = min(ys), max(ys)
+        return (x0, y0, x1 - x0 + 1, y1 - y0 + 1)
+
+
+class _DenseTiles:
+    """Grid backed by flat arrays: 1.35M tile entries without the dict-of-tuples
+    overhead (hundreds of MB on a whole-PBF run).
+
+    The optional grid hint sizes the arrays once; a tile outside it (a caller
+    that guessed the range wrong) grows the grid instead of being dropped.  The
+    container grid written by close() stays the tight bounding box of the tiles
+    actually present, exactly like the dict storage did, so the on-disk
+    presence bitmap is unchanged.
+    """
+
+    __slots__ = ("x0", "y0", "nx", "ny", "off", "length", "flags", "present",
+                 "count", "_min_x", "_max_x", "_min_y", "_max_y")
+
+    def __init__(self, x0, y0, nx, ny):
+        cells = nx * ny
+        self.x0, self.y0, self.nx, self.ny = x0, y0, nx, ny
+        self.off = array("I", bytes(4 * cells))
+        self.length = array("H", bytes(2 * cells))
+        self.flags = array("H", bytes(2 * cells))
+        self.present = bytearray((cells + 7) // 8)
+        self.count = 0
+        self._min_x = self._min_y = None
+        self._max_x = self._max_y = None
+
+    def _bit(self, i):
+        return (self.present[i >> 3] >> (7 - (i & 7))) & 1
+
+    def _index(self, x, y):
+        lx, ly = x - self.x0, y - self.y0
+        if lx < 0 or ly < 0 or lx >= self.nx or ly >= self.ny:
+            return -1
+        return ly * self.nx + lx
+
+    def get(self, x, y):
+        i = self._index(x, y)
+        if i < 0 or not self._bit(i):
+            return None
+        return (self.off[i], self.length[i], self.flags[i])
+
+    def put(self, x, y, entry):
+        i = self._index(x, y)
+        if i < 0:
+            self._grow(x, y)
+            i = self._index(x, y)
+        if not self._bit(i):
+            self.present[i >> 3] |= 1 << (7 - (i & 7))
+            self.count += 1
+        self.off[i], self.length[i], self.flags[i] = entry
+        if self._min_x is None:
+            self._min_x = self._max_x = x
+            self._min_y = self._max_y = y
+        else:
+            if x < self._min_x:
+                self._min_x = x
+            elif x > self._max_x:
+                self._max_x = x
+            if y < self._min_y:
+                self._min_y = y
+            elif y > self._max_y:
+                self._max_y = y
+
+    def __len__(self):
+        return self.count
+
+    def grid(self):
+        if self._min_x is None:
+            return (0, 0, 0, 0)
+        return (self._min_x, self._min_y,
+                self._max_x - self._min_x + 1, self._max_y - self._min_y + 1)
+
+    def _grow(self, x, y):
+        """Rebuild the arrays around the union of the current grid and (x, y)."""
+        gx0, gy0 = min(self.x0, x), min(self.y0, y)
+        gx1, gy1 = max(self.x0 + self.nx - 1, x), max(self.y0 + self.ny - 1, y)
+        grown = _DenseTiles(gx0, gy0, gx1 - gx0 + 1, gy1 - gy0 + 1)
+        for i in range(self.nx * self.ny):
+            if self._bit(i):
+                lx, ly = i % self.nx, i // self.nx
+                grown.put(self.x0 + lx, self.y0 + ly,
+                          (self.off[i], self.length[i], self.flags[i]))
+        self.x0, self.y0, self.nx, self.ny = grown.x0, grown.y0, grown.nx, grown.ny
+        self.off, self.length, self.flags = grown.off, grown.length, grown.flags
+        self.present, self.count = grown.present, grown.count
+
+
 class MapWriter:
     """Streams tile payloads to a temporary file and writes the container at close()."""
 
     def __init__(self, path: str, *, bits: int = 1, tile_px: int = 256, name: str = "",
                  attribution: str = ATTRIBUTION, bbox=None, dark: bool = False,
-                 deflate_level: int = 6, ref_px: int = 480, progress=None):
+                 deflate_level: int = 6, ref_px: int = 480, progress=None,
+                 tile_grids=None):
         if bits not in (1, 2):
             raise ValueError("bits must be 1 or 2")
         if bbox is None:
@@ -347,13 +462,20 @@ class MapWriter:
         self.name = name
         self.attribution = attribution
         self.bbox = tuple(float(v) for v in bbox)
-        self.dark = bool(dark)
+        if dark:
+            warnings.warn("MapWriter(dark=...) is deprecated and ignored; the dark theme "
+                          "is applied at runtime by the device.", DeprecationWarning,
+                          stacklevel=2)
         self.deflate_level = int(deflate_level)
         self.ref_px = ref_px
         self.progress = progress
 
-        # z -> {(x, y): (offset_in_temp, length, flags)}
-        self._entries: dict[int, dict[tuple[int, int], tuple[int, int, int]]] = {}
+        # z -> tile store. With a grid hint it is a dense array grid, otherwise
+        # a dict keyed by (x, y); both expose get/put/len/grid. The dense path
+        # exists because the dict-of-tuples cost ~250 MB on a whole-PBF writer.
+        self._tile_grids = {int(z): (int(g[0]), int(g[1]), int(g[2]), int(g[3]))
+                            for z, g in (tile_grids or {}).items()}
+        self._entries: dict[int, object] = {}
         self._payload_size = 0
         self._tiles = 0
         self._blank = 0
@@ -366,6 +488,14 @@ class MapWriter:
             prefix=".mmap-payload-", suffix=".tmp")
 
     # ---- tiles ----
+    def _zoom_for(self, z: int):
+        store = self._entries.get(z)
+        if store is None:
+            grid = self._tile_grids.get(z)
+            store = _DenseTiles(*grid) if grid else _DictTiles()
+            self._entries[z] = store
+        return store
+
     def add_tile_compressed(self, z: int, x: int, y: int, data: bytes,
                             blank: int = 0) -> int:
         """Adds an already packed and deflated tile. Returns the stored length.
@@ -377,8 +507,8 @@ class MapWriter:
         if blank:
             flags = TILE_FLAG_BLANK | (TILE_FLAG_BLANK_BLACK if blank == 2 else 0)
             data = b""
-        bucket = self._entries.setdefault(z, {})
-        prev = bucket.get((x, y))
+        store = self._zoom_for(z)
+        prev = store.get(x, y)
         if prev is None:
             off = self._payload_size
             if data:
@@ -403,7 +533,7 @@ class MapWriter:
                 off = self._payload_size
                 self._tmp.write(data)
                 self._payload_size += len(data)
-        self._entries[z][(x, y)] = (off, len(data), flags)
+        store.put(x, y, (off, len(data), flags))
         self._tiles += 1
         if blank:
             self._blank += 1
@@ -474,8 +604,14 @@ class MapWriter:
             cursor += 4 + len(self._preview[2])
         payload_start = (cursor + 3) & ~3
 
+        # Payloads are rewritten row-major (z, y, x) while the container is
+        # assembled: the temp stream is in worker completion order, which changes
+        # between runs and scatters neighbouring tiles over the file. `ordered`
+        # collects the live payloads in their final order: the index walk below
+        # already visits the grid that way, so no second pass is needed.
         sections = []  # (type, aux, offset, blob)
-        payload_total = 0
+        ordered = []   # (temp offset, length) in container order
+        payload_cursor = payload_start
         for (z, x0, y0, nx, ny, pb, fb, ib) in plans:
             sec = bytearray(ZOOM_HEADER_SIZE + pb + fb + ib)
             presence_off = ZOOM_HEADER_SIZE
@@ -483,24 +619,27 @@ class MapWriter:
             index_off = prefix_off + fb
             entries = self._entries[z]
             rank = 0
+            payload_bytes = 0
             prefix = []
             for yy in range(ny):
                 prefix.append(rank)
                 for xx in range(nx):
-                    entry = entries.get((x0 + xx, y0 + yy))
+                    entry = entries.get(x0 + xx, y0 + yy)
                     if entry is None:
                         continue
                     bit = yy * nx + xx
                     sec[presence_off + (bit >> 3)] |= 0x80 >> (bit & 7)
-                    off, length, tile_flags = entry
+                    temp_off, length, tile_flags = entry
                     struct.pack_into("<IHH", sec, index_off + rank * TILE_ENTRY_SIZE,
-                                     (payload_start + off) if length else 0, length, tile_flags)
+                                     payload_cursor if length else 0, length, tile_flags)
+                    if length:
+                        ordered.append((temp_off, length))
+                        payload_cursor += length
+                    payload_bytes += length
                     rank += 1
             prefix.append(rank)
             for i, v in enumerate(prefix):
                 struct.pack_into("<I", sec, prefix_off + i * 4, v)
-            payload_bytes = sum(e[1] for e in entries.values())
-            payload_total += payload_bytes
             ZOOM_STRUCT.pack_into(sec, 0, z, self.bits, FLAG_DEFLATE,
                                   x0, nx, y0, ny, presence_off, prefix_off, index_off,
                                   payload_start, payload_bytes, rank)
@@ -525,10 +664,8 @@ class MapWriter:
             flags |= FLAG_POI
         if self._preview:
             flags |= FLAG_PREVIEW
-        if self.dark:
-            flags |= FLAG_DARK
 
-        file_size = payload_start + self._payload_size
+        file_size = payload_cursor
         header = HEADER_STRUCT.pack(
             MAGIC, VERSION, HEADER_SIZE, flags, self.tile_px, self.bits,
             len(zooms), len(sections), HEADER_SIZE, file_size,
@@ -548,10 +685,12 @@ class MapWriter:
             self._tmp.flush()
             self._tmp.close()
             with open(self._tmp.name, "rb") as src:
-                while True:
-                    chunk = src.read(1 << 20)
-                    if not chunk:
-                        break
+                for temp_off, length in ordered:
+                    src.seek(temp_off)
+                    chunk = src.read(length)
+                    if len(chunk) != length:   # truncated temp: never write garbage
+                        raise OSError(f"payload temp is short at {temp_off}: "
+                                      f"{len(chunk)}/{length} bytes")
                     out.write(chunk)
             out.truncate(file_size)
         os.unlink(self._tmp.name)
@@ -561,20 +700,16 @@ class MapWriter:
             "bytes": file_size,
             "tiles": self._tiles,
             "blank": self._blank,
-            # Referenced payload only: a replaced tile can leave dead bytes in
-            # the append-only stream, those are not part of the container content.
-            "payload_bytes": payload_total,
+            # Referenced payload only: dead bytes of replaced tiles are never
+            # copied (the container is rewritten row-major and compacted).
+            "payload_bytes": payload_cursor - payload_start,
             "raw_bytes": self._raw_bytes,
             "zooms": tiles_per_zoom,
             "pois": len(self._pois),
         }
 
     def _grid_bbox(self, z: int):
-        xs = [k[0] for k in self._entries[z]]
-        ys = [k[1] for k in self._entries[z]]
-        x0, x1 = min(xs), max(xs)
-        y0, y1 = min(ys), max(ys)
-        return (x0, y0, x1 - x0 + 1, y1 - y0 + 1)
+        return self._entries[z].grid()
 
     def abort(self):
         try:
@@ -692,12 +827,113 @@ class MapReader:
             fh.seek(off)
             return zlib.decompress(fh.read(length)), flags
 
+    def iter_tiles(self, z: int):
+        """Walks the present tiles of a zoom in rank order, raw payloads.
+
+        Yields ``(x, y, payload, flags)``.  The payload is the deflated stream
+        as stored, without inflating it: merge() copies it verbatim.
+        """
+        info = self.zooms.get(z)
+        if info is None:
+            return
+        presence, index = info["presence"], info["index"]
+        x0, y0, nx, ny = info["x0"], info["y0"], info["nx"], info["ny"]
+        rank = 0
+        with open(self.path, "rb") as fh:
+            for ly in range(ny):
+                for lx in range(nx):
+                    bit = ly * nx + lx
+                    if not (presence[bit >> 3] >> (7 - (bit & 7))) & 1:
+                        continue
+                    off, length, flags = TILE_STRUCT.unpack_from(
+                        index, rank * TILE_ENTRY_SIZE)
+                    rank += 1
+                    if flags & TILE_FLAG_BLANK or length == 0:
+                        yield x0 + lx, y0 + ly, b"", flags
+                    else:
+                        fh.seek(off)
+                        yield x0 + lx, y0 + ly, fh.read(length), flags
+
     def stats(self) -> dict:
         per_zoom = {}
         for z, info in sorted(self.zooms.items()):
             per_zoom[z] = {"tiles": info["present"], "grid": (info["nx"], info["ny"]),
                            "payload_bytes": info["payload_size"]}
         return per_zoom
+
+
+def merge_containers(inputs, out_path, name=None, priority="last", verbose=True):
+    """Merges .mmap containers into one, copying the payloads verbatim.
+
+    The deflated streams are independent, so the tiles move to the new file
+    without touching zlib at all; only the offsets change.  On a tile present in
+    more than one input the last one wins by default (``priority="first"`` keeps
+    the first instead).  POIs are concatenated without de-duplication and the
+    output carries no preview section.  The typical use is one file for two
+    separate regions without re-rendering: the gap between them only costs
+    presence bits.
+    """
+    readers = [MapReader(path) for path in inputs]
+    bits = readers[0].bits
+    for path, reader in zip(inputs, readers):
+        if reader.tile_px != readers[0].tile_px:
+            raise SystemExit(f"[!] {path}: {reader.tile_px}px tiles, "
+                             f"expected {readers[0].tile_px}")
+        if reader.bits != bits:
+            raise SystemExit(f"[!] {path}: {reader.bits} bit/pixel, expected {bits}")
+        for z, info in reader.zooms.items():
+            if info["bits"] != bits:
+                raise SystemExit(f"[!] {path}: z{z} is {info['bits']} bit/pixel, "
+                                 f"expected {bits}")
+
+    bbox = (min(r.bbox[0] for r in readers), min(r.bbox[1] for r in readers),
+            max(r.bbox[2] for r in readers), max(r.bbox[3] for r in readers))
+
+    # Grid hint per zoom: union of the input grids, so the writer can use its
+    # dense arrays even when the merged area is huge and sparse.
+    extents = {}
+    for reader in readers:
+        for z, info in reader.zooms.items():
+            x1 = info["x0"] + info["nx"] - 1
+            y1 = info["y0"] + info["ny"] - 1
+            cur = extents.get(z)
+            if cur is None:
+                extents[z] = [info["x0"], info["y0"], x1, y1]
+            else:
+                cur[0], cur[1] = min(cur[0], info["x0"]), min(cur[1], info["y0"])
+                cur[2], cur[3] = max(cur[2], x1), max(cur[3], y1)
+    tile_grids = {z: (g[0], g[1], g[2] - g[0] + 1, g[3] - g[1] + 1)
+                  for z, g in extents.items()}
+
+    writer = MapWriter(out_path, bits=bits, tile_px=readers[0].tile_px,
+                       name=name or readers[0].name, bbox=bbox,
+                       tile_grids=tile_grids)
+    written = False
+    try:
+        order = readers if priority == "last" else list(reversed(readers))
+        for reader in order:
+            for z in sorted(reader.zooms):
+                for x, y, payload, flags in reader.iter_tiles(z):
+                    if flags & TILE_FLAG_BLANK:
+                        writer.add_tile_compressed(
+                            z, x, y, b"", 2 if flags & TILE_FLAG_BLANK_BLACK else 1)
+                    else:
+                        writer.add_tile_compressed(z, x, y, payload)
+        for reader in readers:   # POIs in input order, duplicates included
+            for poi in reader.pois:
+                writer.add_poi(poi["lat"], poi["lon"], poi["kind"],
+                               poi["population"], poi["name"])
+        stats = writer.close()
+        written = True
+    finally:
+        if not written:
+            writer.abort()
+    if verbose:
+        print(f"[*] merged {len(inputs)} containers: {stats['tiles']} tiles, "
+              f"{stats['blank']} blank, {stats['pois']} POIs")
+        print(f"[*] wrote {out_path} ({stats['bytes'] / 1e6:.2f} MB, "
+              f"zooms {sorted(stats['zooms'])})")
+    return stats
 
 
 # --------------------------------------------------------------------------- #
@@ -934,6 +1170,12 @@ def _cmd_pack_tree(args) -> int:
     return 0
 
 
+def _cmd_merge(args) -> int:
+    merge_containers(args.inputs, args.out, name=args.name,
+                     priority=args.priority, verbose=True)
+    return 0
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="MonoMesh .mmap container tools")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -972,6 +1214,14 @@ def main(argv=None) -> int:
     p.add_argument("--jobs", type=int, default=None)
     p.add_argument("--verbose", action="store_true")
     p.set_defaults(func=_cmd_pack_tree)
+
+    p = sub.add_parser("merge", help="merge containers (payloads copied verbatim)")
+    p.add_argument("out")
+    p.add_argument("inputs", nargs="+")
+    p.add_argument("--priority", choices=["last", "first"], default="last",
+                   help="which input wins on duplicate tiles (default: last)")
+    p.add_argument("--name", default=None, help="region name (default: the first input)")
+    p.set_defaults(func=_cmd_merge)
 
     args = ap.parse_args(argv)
     return args.func(args)

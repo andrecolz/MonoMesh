@@ -71,14 +71,15 @@ static const RowDef SYSTEM_ROWS[] = {
     {RowKind::Slider, "Brightness"},     // 0
     {RowKind::Slider, "Volume"},         // 1
     {RowKind::Toggle, "LED notifications"}, // 2
-    {RowKind::Value, "Buzzer mode"},     // 3
-    {RowKind::Value, "Clock face"},      // 4
-    {RowKind::Value, "Power button"},    // 5
-    {RowKind::Buttons3, "Low power"},    // 6
-    {RowKind::Action, "Reboot"},         // 7
-    {RowKind::Action, "Power off"}       // 8
+    {RowKind::Toggle, "Map dark theme"}, // 3
+    {RowKind::Value, "Buzzer mode"},     // 4
+    {RowKind::Value, "Clock face"},      // 5
+    {RowKind::Value, "Power button"},    // 6
+    {RowKind::Buttons3, "Low power"},    // 7
+    {RowKind::Action, "Reboot"},         // 8
+    {RowKind::Action, "Power off"}       // 9
 };
-static constexpr int SYSTEM_N = 9;
+static constexpr int SYSTEM_N = 10;
 
 static const RowDef RADIO_ROWS[] = {
     {RowKind::Value, "Region"},     // 0
@@ -417,19 +418,22 @@ void ViewSettings::drawSystem(M5GFX& gfx, int onlyRow) {
         toggleRow(gfx, r[2], SYSTEM_ROWS[2].label, BSP::getInstance().getLedNotifications());
     }
     if (onlyRow < 0 || onlyRow == 3) {
-        valueRow(gfx, r[3], SYSTEM_ROWS[3].label, buzzerModeLabel((uint8_t)BSP::getInstance().getBuzzerMode()));
+        toggleRow(gfx, r[3], SYSTEM_ROWS[3].label, ms.getMapDarkTheme());
     }
     if (onlyRow < 0 || onlyRow == 4) {
-        valueRow(gfx, r[4], SYSTEM_ROWS[4].label, CLOCK_LABELS[clockFaceIndex(ms)]);
+        valueRow(gfx, r[4], SYSTEM_ROWS[4].label, buzzerModeLabel((uint8_t)BSP::getInstance().getBuzzerMode()));
     }
     if (onlyRow < 0 || onlyRow == 5) {
-        valueRow(gfx, r[5], SYSTEM_ROWS[5].label, powerModeLabel(ms.getPowerBtnAction()));
+        valueRow(gfx, r[5], SYSTEM_ROWS[5].label, CLOCK_LABELS[clockFaceIndex(ms)]);
     }
     if (onlyRow < 0 || onlyRow == 6) {
-        buttons3Row(gfx, r[6], "STANDBY", "CLOCK", "CLOCK+RX");
+        valueRow(gfx, r[6], SYSTEM_ROWS[6].label, powerModeLabel(ms.getPowerBtnAction()));
     }
-    if (onlyRow < 0 || onlyRow == 7) actionRow(gfx, r[7], SYSTEM_ROWS[7].label);
+    if (onlyRow < 0 || onlyRow == 7) {
+        buttons3Row(gfx, r[7], "STANDBY", "CLOCK", "CLOCK+RX");
+    }
     if (onlyRow < 0 || onlyRow == 8) actionRow(gfx, r[8], SYSTEM_ROWS[8].label);
+    if (onlyRow < 0 || onlyRow == 9) actionRow(gfx, r[9], SYSTEM_ROWS[9].label);
 }
 
 void ViewSettings::drawRadio(M5GFX& gfx, int onlyRow) {
@@ -1074,11 +1078,17 @@ bool ViewSettings::handleSystemTouch(const TouchEvent& ev) {
         redrawRow(2);
         return true;
     }
-    if (inRow(ev, r[3])) { openSelect(SelectTarget::BuzzerMode); return true; }
-    if (inRow(ev, r[4])) { openSelect(SelectTarget::ClockFace); return true; }
-    if (inRow(ev, r[5])) { openSelect(SelectTarget::PowerButton); return true; }
-    if (inRow(ev, r[6])) {
-        const int which = buttons3Hit(ev, r[6]);
+    if (inRow(ev, r[3])) { // Map dark theme (containers stay light on disk)
+        ms.setMapDarkTheme(!ms.getMapDarkTheme());
+        markSavePending();
+        redrawRow(3);
+        return true;
+    }
+    if (inRow(ev, r[4])) { openSelect(SelectTarget::BuzzerMode); return true; }
+    if (inRow(ev, r[5])) { openSelect(SelectTarget::ClockFace); return true; }
+    if (inRow(ev, r[6])) { openSelect(SelectTarget::PowerButton); return true; }
+    if (inRow(ev, r[7])) {
+        const int which = buttons3Hit(ev, r[7]);
         if (which >= 0) {
             ms.saveConfig(); // entering a low-power mode: persist everything before the rails change
             BSP::getInstance().enterLowPower(which == 0 ? BSP::PowerMode::Standby
@@ -1088,8 +1098,8 @@ bool ViewSettings::handleSystemTouch(const TouchEvent& ev) {
         }
         return false;
     }
-    if (inRow(ev, r[7])) { openConfirm(ConfirmTarget::Reboot); return true; }
-    if (inRow(ev, r[8])) { openConfirm(ConfirmTarget::PowerOff); return true; }
+    if (inRow(ev, r[8])) { openConfirm(ConfirmTarget::Reboot); return true; }
+    if (inRow(ev, r[9])) { openConfirm(ConfirmTarget::PowerOff); return true; }
     return false;
 }
 

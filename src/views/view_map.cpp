@@ -78,30 +78,42 @@ void tileToLatLon(double tx, double ty, int z, double& lat, double& lon) {
 
 // Packed-bit expansion tables. The four grey levels are the values the SSD1677
 // maps to exactly one level each (no extra dithering on the device), so a 2 bit
-// tile reproduces the anti-aliased labels of the old 8-bit PNGs.
-const uint8_t* expandTable1() {
-    static uint8_t table[256][8];
+// tile reproduces the anti-aliased labels of the old 8-bit PNGs.  The dark
+// theme flips the palette here, and only here: containers are always stored in
+// the light style (FLAG_DARK is ignored by MapPack).
+const uint8_t* expandTable1(bool dark) {
+    static uint8_t light[256][8];
+    static uint8_t darkTable[256][8];
     static bool ready = false;
     if (!ready) {
         for (int v = 0; v < 256; ++v) {
-            for (int k = 0; k < 8; ++k) table[v][k] = (v & (0x80 >> k)) ? 255 : 0;
+            for (int k = 0; k < 8; ++k) {
+                const uint8_t on = (v & (0x80 >> k)) ? 255 : 0;
+                light[v][k] = on;
+                darkTable[v][k] = 255 - on;
+            }
         }
         ready = true;
     }
-    return &table[0][0];
+    return dark ? &darkTable[0][0] : &light[0][0];
 }
 
-const uint8_t* expandTable2() {
+const uint8_t* expandTable2(bool dark) {
     static const uint8_t levels[4] = {0, 96, 160, 255};
-    static uint8_t table[256][4];
+    static uint8_t light[256][4];
+    static uint8_t darkTable[256][4];
     static bool ready = false;
     if (!ready) {
         for (int v = 0; v < 256; ++v) {
-            for (int k = 0; k < 4; ++k) table[v][k] = levels[(v >> (6 - 2 * k)) & 3];
+            for (int k = 0; k < 4; ++k) {
+                const uint8_t idx = (v >> (6 - 2 * k)) & 3;
+                light[v][k] = levels[idx];
+                darkTable[v][k] = levels[3 - idx];
+            }
         }
         ready = true;
     }
-    return &table[0][0];
+    return dark ? &darkTable[0][0] : &light[0][0];
 }
 } // namespace
 
@@ -127,6 +139,8 @@ void ViewMap::releaseSdHandles() {
     // that card. The next update() notices the card state change and reopens it.
     _pack.close();
     _usePack = false;
+    _basemap.close();
+    _useBasemap = false;
     invalidateTileCache();
     // Force the next update() through the "card changed" path, which re-scans and
     // reopens the container once the card is mounted again after the wake.
@@ -137,6 +151,7 @@ ViewMap::~ViewMap() {
     StorageManager::getInstance().clearSdReleaseHook(this);
     releaseCanvas();
     _pack.close();
+    _basemap.close();
     for (auto& slot : _tileCache) {
         if (slot.data) free(slot.data);
         slot.data = nullptr;
@@ -188,6 +203,7 @@ void ViewMap::toast(const char* fmt, ...) {
 
 void ViewMap::onEnter() {
     ensureCanvas();
+    openBasemap();
 
     const bool sd = StorageManager::getInstance().isSdMounted();
     if (!_viewInitialised || sd != _sdWasMounted) {
@@ -281,7 +297,7 @@ void ViewMap::update() {
         scanRegions();
         if (!_regions.empty()) {
             if (_regionIndex >= _regions.size()) _regionIndex = 0;
-            openRegion(_regionIndex, false);
+            if (!openRegion(_regionIndex, false)) scanZooms();  // broken container: PNG fallback
         } else {
             _pack.close();
             _usePack = false;
@@ -289,6 +305,7 @@ void ViewMap::update() {
         }
         invalidateTileCache();
         ensureZoomAvailable();
+        openBasemap();
         _dirtyFast = true;
     }
 
@@ -508,31 +525,41 @@ bool ViewMap::loadSlot(int slot, int z, int x, int y) {
     }
 
     if (_usePack) {
-        if (_pack.selectedZoom() != z && !_pack.selectZoom(z)) return false;
-        const size_t bytes = _pack.packedTileBytes();
-        uint32_t offset = 0;
-        uint16_t length = 0, flags = 0;
-        if (!_pack.tileAt(x, y, offset, length, flags)) return false;   // no tile here
-        if ((flags & 1) || length == 0) {                                // empty tile: no payload
-            // Bit 1 of the flags carries the real fill colour (mono_map.py TILE_FLAG_BLANK_BLACK):
-            // a solid black tile in a light style (a lake at high zoom) must not be painted with the
-            // theme colour. Only tiles with no flag at all fall back to the style.
-            const bool black = (flags & 2) ? true : ((flags & 1) ? false : _pack.blankIsBlack());
-            s.state = black ? SLOT_BLANK_BLACK : SLOT_BLANK_WHITE;
+        const bool zoomReady = (_pack.selectedZoom() == z) || _pack.selectZoom(z);
+        if (zoomReady) {
+            const size_t bytes = _pack.packedTileBytes();
+            uint32_t offset = 0;
+            uint16_t length = 0, flags = 0;
+            if (_pack.tileAt(x, y, offset, length, flags)) {
+                if ((flags & 1) || length == 0) {                        // empty tile: no payload
+                    // The slot keeps the *content* colour (mono_map.py TILE_FLAG_BLANK_BLACK is a
+                    // solid black tile, e.g. a lake); blitSlot inverts it when the dark theme is on.
+                    s.state = (flags & 2) ? SLOT_BLANK_BLACK : SLOT_BLANK_WHITE;
+                    return true;
+                }
+                uint8_t* buf = (uint8_t*)heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+                if (!buf) buf = (uint8_t*)malloc(bytes);
+                if (!buf) return false;
+                size_t got = 0;
+                if (!_pack.readTile(x, y, buf, bytes, got)) {
+                    free(buf);
+                    return false;
+                }
+                s.data = buf;
+                s.len = got;
+                s.state = SLOT_PACKED;
+                ++_statTileReads;
+                return true;
+            }
+        }
+        // The region has no such tile (or no such zoom): a parent level of the
+        // same container, then the global basemap, then the hatch. Tiles present
+        // but blank returned above and never reach this fallback.
+        if (loadOverzoom(slot, _pack, true, z, x, y, kOverzoomLevels)) return true;
+        if (_useBasemap && loadOverzoom(slot, _basemap, false, z, x, y, kOverzoomLevels)) {
             return true;
         }
-        uint8_t* buf = (uint8_t*)heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-        if (!buf) buf = (uint8_t*)malloc(bytes);
-        if (!buf) return false;
-        size_t got = 0;
-        if (!_pack.readTile(x, y, buf, bytes, got)) {
-            free(buf);
-            return false;
-        }
-        s.data = buf;
-        s.len = got;
-        s.state = SLOT_PACKED;
-        ++_statTileReads;
+        s.state = SLOT_HATCH;
         return true;
     }
 
@@ -575,9 +602,75 @@ bool ViewMap::loadSlot(int slot, int z, int x, int y) {
     return true;
 }
 
+// The global basemap is optional and lives next to the regions in /maps.
+void ViewMap::openBasemap() {
+    if (_useBasemap && _basemap.isOpen()) return;
+    _basemap.close();
+    _useBasemap = false;
+    if (!StorageManager::getInstance().isSdMounted()) return;
+    // The FS API prepends the mount point; the "/sdcard/..." form covers cards
+    // with a real nested folder (the same fallback the legacy tile tree uses).
+    const char* paths[2] = {"/maps/basemap.mmap", "/sdcard/maps/basemap.mmap"};
+    for (const char* path : paths) {
+        if (SD_MMC.exists(path) && _basemap.open(path)) {
+            _useBasemap = true;
+            ESP_LOGI("ViewMap", "basemap: %s (%u zoom, %d..%d)", path,
+                     (unsigned)_basemap.zoomCount(), _basemap.firstZoom(), _basemap.lastZoom());
+            return;
+        }
+    }
+}
+
+// One parent level after the other, up to `maxLevels`: the packed parent bits
+// are copied into the child slot and blitSlot scales them nearest-neighbour.
+// The primary container is queried without selecting the parent zoom, so a
+// coverage edge does not reload the index once per tile.
+bool ViewMap::loadOverzoom(int slot, MapPack& pack, bool primary, int z, int x, int y,
+                           int maxLevels) {
+    TileSlot& s = _tileCache[slot];
+    for (int k = 1; k <= maxLevels && z - k >= ZOOM_MIN; ++k) {
+        const int pz = z - k;
+        const int px = x >> k, py = y >> k;
+        uint32_t offset = 0;
+        uint16_t length = 0, flags = 0;
+        const bool present = primary
+            ? _pack.tileAtZoom(pz, px, py, offset, length, flags)
+            : (pack.selectZoom(pz) && pack.tileAt(px, py, offset, length, flags));
+        if (!present) continue;
+        if ((flags & 1) || length == 0) {
+            // A blank parent overzooms to a solid child of the same colour.
+            s.state = (flags & 2) ? SLOT_BLANK_BLACK : SLOT_BLANK_WHITE;
+            return true;
+        }
+        const uint8_t bits = primary ? _pack.zoomBits(pz) : pack.selectedBits();
+        const int srcPx = pack.tilePx();
+        if (bits < 1 || srcPx <= 0) continue;
+        const size_t bytes = (size_t)srcPx * srcPx * bits / 8;
+        uint8_t* buf = (uint8_t*)heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!buf) buf = (uint8_t*)malloc(bytes);
+        if (!buf) return false;
+        size_t got = 0;
+        const bool ok = primary ? _pack.readTileZoom(pz, px, py, buf, bytes, got)
+                                : pack.readTile(px, py, buf, bytes, got);
+        if (!ok) {
+            free(buf);
+            continue;
+        }
+        s.data = buf;
+        s.len = got;
+        s.state = SLOT_OVERZOOM;
+        s.overzoom = (uint8_t)k;
+        s.srcBits = bits;
+        s.srcPx = (uint16_t)srcPx;
+        return true;
+    }
+    return false;
+}
+
 void ViewMap::blitSlot(int slot, int canvasX, int canvasY) {
     if (!_canvasReady) return;
     const TileSlot& s = _tileCache[slot];
+    const bool dark = MeshService::getInstance().getMapDarkTheme();
     switch (s.state) {
         case SLOT_PACKED: {
             const int bits = _pack.selectedBits();
@@ -588,7 +681,7 @@ void ViewMap::blitSlot(int slot, int canvasX, int canvasY) {
             if (dx0 >= dx1 || dy0 >= dy1) return;
             uint8_t* buf = (uint8_t*)_canvas.getBuffer();
             if (bits == 1) {
-                const uint8_t* lut = expandTable1();
+                const uint8_t* lut = expandTable1(dark);
                 for (int y = dy0; y < dy1; ++y) {
                     const uint8_t* src = s.data + (size_t)(y - canvasY) * srcRowBytes;
                     uint8_t* dst = buf + (size_t)y * 480 + dx0;
@@ -600,7 +693,7 @@ void ViewMap::blitSlot(int slot, int canvasX, int canvasY) {
                     while (i < n) { dst[i++] = lut[(src[p >> 3] << 3) + (p & 7)]; ++p; }
                 }
             } else {
-                const uint8_t* lut = expandTable2();
+                const uint8_t* lut = expandTable2(dark);
                 for (int y = dy0; y < dy1; ++y) {
                     const uint8_t* src = s.data + (size_t)(y - canvasY) * srcRowBytes;
                     uint8_t* dst = buf + (size_t)y * 480 + dx0;
@@ -614,16 +707,65 @@ void ViewMap::blitSlot(int slot, int canvasX, int canvasY) {
             }
             break;
         }
+        case SLOT_OVERZOOM: {
+            // Nearest-neighbour 2^k upscale of the parent tile, showing only the
+            // quadrant this child covers.
+            const int scale = 1 << s.overzoom;
+            const int srcPx = s.srcPx ? s.srcPx : TILE_PX;
+            const int srcRowBytes = srcPx * s.srcBits / 8;
+            const int dx0 = std::max(0, canvasX), dx1 = std::min(480, canvasX + TILE_PX);
+            const int dy0 = std::max(0, canvasY), dy1 = std::min(CV_H, canvasY + TILE_PX);
+            if (dx0 >= dx1 || dy0 >= dy1 || !s.data) return;
+            uint8_t* buf = (uint8_t*)_canvas.getBuffer();
+            const int qx = (s.x & (scale - 1)) * (srcPx / scale);
+            const int qy = (s.y & (scale - 1)) * (srcPx / scale);
+            if (s.srcBits == 1) {
+                const uint8_t* lut = expandTable1(dark);
+                for (int y = dy0; y < dy1; ++y) {
+                    const int sy = qy + (y - canvasY) / scale;
+                    const uint8_t* src = s.data + (size_t)sy * srcRowBytes;
+                    uint8_t* dst = buf + (size_t)y * 480;
+                    for (int x = dx0; x < dx1; ++x) {
+                        const int sx = qx + (x - canvasX) / scale;
+                        dst[x] = lut[((size_t)src[sx >> 3] << 3) + (sx & 7)];
+                    }
+                }
+            } else {
+                const uint8_t* lut = expandTable2(dark);
+                for (int y = dy0; y < dy1; ++y) {
+                    const int sy = qy + (y - canvasY) / scale;
+                    const uint8_t* src = s.data + (size_t)sy * srcRowBytes;
+                    uint8_t* dst = buf + (size_t)y * 480;
+                    for (int x = dx0; x < dx1; ++x) {
+                        const int sx = qx + (x - canvasX) / scale;
+                        dst[x] = lut[((size_t)src[sx >> 2] << 2) + (sx & 3)];
+                    }
+                }
+            }
+            break;
+        }
+        case SLOT_HATCH: {
+            // "No data here": a diagonal 1-bit pattern, so an uncovered area is
+            // never confused with a tile that is legitimately empty (white).
+            const uint16_t bg = dark ? TFT_BLACK : TFT_WHITE;
+            const uint16_t ink = dark ? TFT_WHITE : TFT_BLACK;
+            _canvas.fillRect(canvasX, canvasY, TILE_PX, TILE_PX, bg);
+            for (int i = -TILE_PX; i < TILE_PX; i += 8) {
+                _canvas.drawLine(canvasX + i, canvasY, canvasX + i + TILE_PX, canvasY + TILE_PX, ink);
+            }
+            break;
+        }
         case SLOT_PNG:
             if (!_canvas.drawPng(s.data, (uint32_t)s.len, canvasX, canvasY)) {
                 _canvas.fillRect(canvasX, canvasY, TILE_PX, TILE_PX, TFT_WHITE);
             }
             break;
         case SLOT_BLANK_WHITE:
-            _canvas.fillRect(canvasX, canvasY, TILE_PX, TILE_PX, TFT_WHITE);
+            // The slot holds the content colour; the dark theme inverts the panel.
+            _canvas.fillRect(canvasX, canvasY, TILE_PX, TILE_PX, dark ? TFT_BLACK : TFT_WHITE);
             break;
         case SLOT_BLANK_BLACK:
-            _canvas.fillRect(canvasX, canvasY, TILE_PX, TILE_PX, TFT_BLACK);
+            _canvas.fillRect(canvasX, canvasY, TILE_PX, TILE_PX, dark ? TFT_WHITE : TFT_BLACK);
             break;
         default:
             break;

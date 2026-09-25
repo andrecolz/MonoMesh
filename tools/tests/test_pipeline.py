@@ -11,7 +11,9 @@ legacy renderer as an oracle to prove the fast path is pixel-identical.
 
 import gzip
 import importlib.util
+import io
 import json
+import math
 import os
 import shutil
 import struct
@@ -389,7 +391,7 @@ class TestOpenWaterRings(unittest.TestCase):
 
 
 class TestRenderParity(SyntheticFixture):
-    def _render_both(self, z, tx, ty, style_dark=False):
+    def _render_both(self, z, tx, ty):
         bbox = self.info["bbox"]
         data = fot.extract_area_from_pbf(self.pbf, *bbox, verbose=False)
         legacy = data.to_legacy_dict()
@@ -397,10 +399,8 @@ class TestRenderParity(SyntheticFixture):
         index = fot.build_tile_index(data, z, locations=locations)
         ref_path = os.path.join(self.tmp, f"ref_{z}_{tx}_{ty}.png")
         fast_path = os.path.join(self.tmp, f"fast_{z}_{tx}_{ty}.png")
-        fot.render_toner_tile_reference(z, tx, ty, legacy["ways"], legacy["places"], ref_path,
-                                        style_dark=style_dark)
-        fot.render_tile_fast(z, tx, ty, index, fast_path, style_dark=style_dark,
-                             save_kwargs={"compress_level": 6})
+        fot.render_toner_tile_reference(z, tx, ty, legacy["ways"], legacy["places"], ref_path)
+        fot.render_tile_fast(z, tx, ty, index, fast_path, save_kwargs={"compress_level": 6})
         return Image.open(ref_path).convert("L"), Image.open(fast_path).convert("L")
 
     def test_tiles_are_pixel_identical(self):
@@ -414,13 +414,6 @@ class TestRenderParity(SyntheticFixture):
                     diff = ImageChops.difference(ref, fast)
                     n_diff = sum(1 for v in diff.getdata() if v)
                     self.assertEqual(n_diff, 0, f"tile {z}/{tx}/{ty} differs in {n_diff} pixels")
-
-    def test_dark_style_is_pixel_identical(self):
-        bbox = self.info["bbox"]
-        z = 13
-        tx, ty = fot.deg2num((bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2, z)
-        ref, fast = self._render_both(z, tx, ty, style_dark=True)
-        self.assertEqual(sum(1 for v in ImageChops.difference(ref, fast).getdata() if v), 0)
 
     def test_fast_renderer_touches_few_ways(self):
         """The whole point of the optimisation: small candidate sets per tile."""
@@ -533,6 +526,37 @@ class TestStyleRules(SyntheticFixture):
         # the most populated city must win the contest for the space
         self.assertIn("City 11", rec.texts)
 
+    def test_label_bleeds_across_tile_border(self):
+        z = 14
+        n = 2.0 ** z
+        tx, ty = 8000, 5700
+        px, py = 254, 128      # anchor two pixels from the right tile border
+        lon = ((tx + px / 256.0) / n) * 360.0 - 180.0
+        lat = math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * (ty + py / 256.0) / n))))
+        name = "Bordoville"
+        labels = fot.place_labels([(lat, lon, 0, name, 1_000_000)], z)
+        self.assertIn((tx, ty), labels)
+        self.assertIn((tx + 1, ty), labels, "il nome deve sbordare nella tile adiacente")
+        # nella tile di destra l'anchor locale è 2 px a sinistra della cucitura
+        self.assertTrue(any(rec[3] == name and rec[0] == -2 and rec[1] == py
+                            for rec in labels[(tx + 1, ty)]))
+
+        place = {"lat": lat, "lon": lon, "type": "city", "name": name,
+                 "population": 1_000_000}
+        left_path = os.path.join(self.tmp, "bleed_left.png")
+        right_path = os.path.join(self.tmp, "bleed_right.png")
+        fot.render_toner_tile_reference(z, tx, ty, [], [place], left_path)
+        fot.render_toner_tile_reference(z, tx + 1, ty, [], [place], right_path)
+        left = Image.open(left_path).convert("L")
+        right = Image.open(right_path).convert("L")
+        # la tile dell'anchor porta il punto e il bordo iniziale del nome
+        self.assertTrue(any(left.getpixel((x, y)) < 128
+                            for x in range(248, 256) for y in range(120, 140)))
+        # la tile adiacente contiene il resto del nome, non un taglio
+        ink = sum(1 for x in range(0, 48) for y in range(100, 140)
+                  if right.getpixel((x, y)) < 128)
+        self.assertGreater(ink, 30, "il nome non prosegue nella tile adiacente")
+
     def test_zoom_policies(self):
         self.assertNotIn("residential", fot.zoom_road_classes(9))
         self.assertIn("residential", fot.zoom_road_classes(13))
@@ -568,6 +592,39 @@ class TestPipeline(SyntheticFixture):
         for key in ("mmap", "stats", "jobs", "pipeline_seconds",
                     "extract_seconds", "index_seconds"):
             self.assertIn(key, res2)
+
+    def test_blank_fast_path_is_pixel_identical(self):
+        # A tile with no geometry and no label is white: the pipeline must emit
+        # exactly what the old render+pack produced (blank payload, white PNG).
+        for mode in fot.PNG_MODES:
+            opts = fot.save_kwargs_for(mode)
+            data = fot.blank_png_bytes(opts)
+            out_im = Image.new("L", (256, 256), 255)
+            if opts.get("bits") == 1:
+                out_im = out_im.convert("1", dither=Image.Dither.NONE)
+            buf = io.BytesIO()
+            out_im.save(buf, format="PNG", **opts)
+            self.assertEqual(data, buf.getvalue(), f"blank PNG diverso in modo {mode}")
+
+        bbox = self.info["bbox"]
+        data = fot.extract_area_from_pbf(self.pbf, *bbox, verbose=False)
+        z = 16
+        index = fot.build_tile_index(data, z, locations=fot.project_ways_at_zoom(data, z))
+        tile = next(((tx, ty)
+                     for ty in range(index.y0, index.y0 + index.ny)
+                     for tx in range(index.x0, index.x0 + index.nx)
+                     if fot.tile_is_blank(index, tx, ty)), None)
+        self.assertIsNotNone(tile, "nessuna tile vuota nel fixture")
+        tx, ty = tile
+        out = os.path.join(self.tmp, "blankfast")
+        os.makedirs(out, exist_ok=True)
+        fot._worker_init(index, {"compress_level": 6}, out, "mmap", 1, 6)
+        res = fot._render_one((z, tx, ty))
+        self.assertEqual(res[4], b"")   # payload vuoto, come il render bianco
+        self.assertEqual(res[5], 1)     # TILE_FLAG_BLANK: bianco pieno
+        im = fot.render_tile_image(z, tx, ty, index)
+        self.assertEqual(im.getextrema(), (255, 255))
+        self.assertEqual(fot.blank_kind(fot.pack_tile_image(im, 256, 1)), 1)
 
     def test_png_modes(self):
         bbox = self.info["bbox"]

@@ -8,8 +8,10 @@ Every test writes a container with MapWriter and reads it back with MapReader,
 so writer and reader can only drift apart by breaking one of these.
 """
 
+import hashlib
 import os
 import shutil
+import struct
 import sys
 import tempfile
 import unittest
@@ -189,6 +191,140 @@ class TestDuplicateTile(MmapFixture):
         self.assertEqual(info["payload_size"], len(c_big))
         self.assertEqual(stats["bytes"], info["payload_off"] + info["payload_size"])
         self.assertEqual(r.tile(13, 100, 200), (big, 0))
+
+
+class TestDeterministicContainer(MmapFixture):
+    """The container bytes must not depend on the order the tiles were produced."""
+
+    def _write(self, path, order):
+        w = mm.MapWriter(path, bits=1, tile_px=TILE_PX, name="det", bbox=BBOX)
+        for z, x, y, seed in order:
+            if seed is None:
+                w.add_tile_compressed(z, x, y, b"", blank=1)
+            else:
+                w.add_tile_compressed(z, x, y, zlib.compress(packed_tile(seed), 6))
+        w.add_poi(45.25, 9.25, "city", 12345, "Citta Test")
+        w.close()
+
+    def test_same_tiles_same_bytes_whatever_the_order(self):
+        tiles = [(12, 100, 200, 1), (12, 101, 200, 2), (12, 100, 201, None),
+                 (13, 100, 200, 3), (13, 101, 200, 4), (13, 100, 201, 5)]
+        a = os.path.join(self.tmp, "a.mmap")
+        b = os.path.join(self.tmp, "b.mmap")
+        self._write(a, tiles)
+        self._write(b, list(reversed(tiles)))   # e.g. a different worker schedule
+
+        def sha(path):
+            with open(path, "rb") as fh:
+                return hashlib.sha256(fh.read()).hexdigest()
+
+        self.assertEqual(sha(a), sha(b))
+
+        r = mm.MapReader(a)
+        info = r.zooms[12]
+        entries = [struct.unpack_from("<IHH", info["index"], i * 8)
+                   for i in range(info["present"])]
+        # rank order is row-major: payload offsets must grow with (y, x)
+        offsets = [entry[0] for entry in entries if entry[1]]
+        self.assertEqual(offsets, sorted(offsets))
+        self.assertEqual(r.tile(12, 101, 200)[0], packed_tile(2))
+
+
+class TestDenseTileStorage(MmapFixture):
+    """The dense grid behind the tile_grids hint must not change the output."""
+
+    def _write(self, path, tiles, tile_grids=None):
+        w = mm.MapWriter(path, bits=1, tile_px=TILE_PX, name="dense", bbox=BBOX,
+                         tile_grids=tile_grids)
+        for z, x, y, seed in tiles:
+            if seed is None:
+                w.add_tile_compressed(z, x, y, b"", blank=2)
+            else:
+                w.add_tile_compressed(z, x, y, zlib.compress(packed_tile(seed), 6))
+        return w.close()
+
+    def test_dense_and_dict_agree_byte_for_byte(self):
+        tiles = [(13, 100, 200, 1), (13, 101, 200, 2), (13, 100, 201, None),
+                 (14, 400, 800, 3)]
+        dict_path = os.path.join(self.tmp, "dict.mmap")
+        dense_path = os.path.join(self.tmp, "dense.mmap")
+        self._write(dict_path, tiles)
+        self._write(dense_path, tiles, tile_grids={13: (100, 200, 2, 2),
+                                                   14: (400, 800, 1, 1)})
+        with open(dict_path, "rb") as fa, open(dense_path, "rb") as fb:
+            self.assertEqual(fa.read(), fb.read())
+
+    def test_grid_grows_for_out_of_hint_tile(self):
+        path = os.path.join(self.tmp, "grow.mmap")
+        tiles = [(13, 100, 200, 1), (13, 102, 200, 5)]   # the second is outside the hint
+        self._write(path, tiles, tile_grids={13: (100, 200, 1, 1)})
+        r = mm.MapReader(path)
+        self.assertEqual(r.tile(13, 102, 200)[0], packed_tile(5))
+        info = r.zooms[13]
+        self.assertEqual((info["x0"], info["nx"]), (100, 3))
+
+
+class TestMerge(MmapFixture):
+    """merge: verbatim payload copy, conflict priority, flags and POIs."""
+
+    def _container(self, path, tiles, pois=()):
+        w = mm.MapWriter(path, bits=1, tile_px=TILE_PX, name="part", bbox=BBOX)
+        for z, x, y, seed in tiles:
+            if seed is None:
+                w.add_tile_compressed(z, x, y, b"", blank=1)
+            elif seed == "black":
+                w.add_tile_compressed(z, x, y, b"", blank=2)
+            else:
+                w.add_tile_compressed(z, x, y, zlib.compress(packed_tile(seed), 6))
+        for lat, lon, kind, pop, name in pois:
+            w.add_poi(lat, lon, kind, pop, name)
+        w.close()
+
+    def test_merge_copies_and_resolves_conflicts(self):
+        a = os.path.join(self.tmp, "a.mmap")
+        b = os.path.join(self.tmp, "b.mmap")
+        out = os.path.join(self.tmp, "merged.mmap")
+        self._container(a, [(13, 100, 200, 1), (13, 101, 200, 2), (13, 100, 201, None)],
+                        pois=[(45.1, 9.1, "city", 10, "Alfa")])
+        self._container(b, [(13, 101, 200, 7), (13, 200, 300, "black"), (14, 1, 1, 3)],
+                        pois=[(45.2, 9.2, "town", 20, "Beta")])
+        stats = mm.merge_containers([a, b], out, verbose=False)
+        self.assertEqual(stats["tiles"], 5)      # 3 + 3 - 1 overlap
+        self.assertEqual(stats["pois"], 2)
+
+        r = mm.MapReader(out)
+        self.assertEqual(r.bits, 1)
+        self.assertEqual(r.zooms[13]["present"], 4)
+        # default priority=last: the overlapping tile comes from b
+        self.assertEqual(r.tile(13, 101, 200)[0], packed_tile(7))
+        self.assertEqual(r.tile(13, 100, 200)[0], packed_tile(1))
+        # blank flags survive with their colour
+        self.assertEqual(r.tile(13, 100, 201), (None, mm.TILE_FLAG_BLANK))
+        self.assertEqual(r.tile(13, 200, 300),
+                         (None, mm.TILE_FLAG_BLANK | mm.TILE_FLAG_BLANK_BLACK))
+        self.assertEqual(r.tile(14, 1, 1)[0], packed_tile(3))
+        self.assertEqual([p["name"] for p in r.pois], ["Alfa", "Beta"])
+        self.assertEqual(mm.main(["verify", out]), 0)
+
+    def test_priority_first_keeps_the_first_container(self):
+        a = os.path.join(self.tmp, "a.mmap")
+        b = os.path.join(self.tmp, "b.mmap")
+        out = os.path.join(self.tmp, "merged.mmap")
+        self._container(a, [(13, 100, 200, 1)])
+        self._container(b, [(13, 100, 200, 7)])
+        mm.merge_containers([a, b], out, priority="first", verbose=False)
+        self.assertEqual(mm.MapReader(out).tile(13, 100, 200)[0], packed_tile(1))
+
+    def test_bits_mismatch_is_rejected(self):
+        a = os.path.join(self.tmp, "a.mmap")
+        c = os.path.join(self.tmp, "c.mmap")
+        out = os.path.join(self.tmp, "merged.mmap")
+        self._container(a, [(13, 100, 200, 1)])
+        w = mm.MapWriter(c, bits=2, tile_px=TILE_PX, name="two", bbox=BBOX)
+        w.add_tile_compressed(13, 100, 200, b"", blank=1)
+        w.close()
+        with self.assertRaises(SystemExit):
+            mm.merge_containers([a, c], out, verbose=False)
 
 
 if __name__ == "__main__":

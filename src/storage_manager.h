@@ -49,6 +49,7 @@ struct SettingsConfig {
     uint16_t antiGhostThreshold;
     bool clockLandscape = true;   // clock face orientation: landscape by default
     bool clockFlip180 = false;    // clock face turned 180° (upside-down wall mount)
+    bool mapDarkTheme = false;    // map view: invert the container palette (device setting)
     uint8_t nodeRole;             // 0=CLIENT, 1=CLIENT_MUTE
     uint32_t nodeInfoIntervalSec; // default 10800 (3h)
     uint32_t telemetryIntervalSec;// default 1800 (30m)

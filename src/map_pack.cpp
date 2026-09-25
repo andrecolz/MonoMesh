@@ -90,6 +90,9 @@ void MapPack::releaseIndex() {
     if (_presence) { free(_presence); _presence = nullptr; }
     if (_prefix) { free(_prefix); _prefix = nullptr; }
     if (_index) { free(_index); _index = nullptr; }
+    if (_entryCache) { free(_entryCache); _entryCache = nullptr; }
+    _entryCacheFirst = 0;
+    _entryCacheCount = 0;
     _indexCount = 0;
     _sel = nullptr;
 }
@@ -140,7 +143,10 @@ bool MapPack::open(const char* path) {
     if (fileSize != 0 && (size_t)fileSize > _file.size() + 4096) {
         ESP_LOGW(TAG, "declared size %u, file %u", (unsigned)fileSize, (unsigned)_file.size());
     }
-    _dark = (flags & (1u << 4)) != 0;
+    // FLAG_DARK is deliberately ignored: the dark theme is a runtime setting
+    // now (ViewMap applies it to the expansion tables), so every container is
+    // treated as light. Regenerating old dark maps is the documented migration.
+    (void)flags;
     char name[33] = {0};
     char attr[49] = {0};
     memcpy(name, head + 48, 32);
@@ -258,6 +264,13 @@ const MapPack::ZoomInfo* MapPack::findZoom(int z) const {
     return nullptr;
 }
 
+const MapPack::ZoomRec* MapPack::findZoomRec(int z) const {
+    for (const auto& rec : _zooms) {
+        if (rec.info.z == z) return &rec;
+    }
+    return nullptr;
+}
+
 bool MapPack::loadIndex(const ZoomRec& rec) {
     releaseIndex();
     // 64-bit math: nx*ny with corrupt values wrapped to a tiny presenceBytes and the bitmap reads
@@ -321,6 +334,14 @@ bool MapPack::loadIndex(const ZoomRec& rec) {
                      (unsigned)(indexBytes / 1024));
         }
     }
+    if (rec.info.present > 0 && !_index) {
+        // Big index: keep a small window of entries in PSRAM so a pan does not
+        // pay a seek+read per tile (see tileAt).
+        _entryCache = (uint8_t*)psramAlloc(kEntryCacheEntries * kTileEntrySize);
+        if (!_entryCache) {
+            ESP_LOGW(TAG, "no PSRAM for the entry cache: one read per tile");
+        }
+    }
     _sel = &rec;
     _selBits = rec.info.bits;
     return true;
@@ -364,11 +385,39 @@ bool MapPack::tileAt(int x, int y, uint32_t& offset, uint16_t& length, uint16_t&
     uint8_t entry[kTileEntrySize];
     if (_index && _indexCount > 0) {
         memcpy(entry, _index + (size_t)rank * kTileEntrySize, kTileEntrySize);
+    } else if (_entryCache && _entryCacheCount > 0 &&
+               rank >= _entryCacheFirst &&
+               rank < (uint32_t)_entryCacheFirst + _entryCacheCount) {
+        memcpy(entry, _entryCache + (size_t)(rank - _entryCacheFirst) * kTileEntrySize,
+               kTileEntrySize);
+#ifdef MONOMESH_MAP_CACHE_DEBUG
+        ++_cacheHits;
+#endif
     } else {
-        // Big index: one small read for the single entry we need.
-        if (!_file.seek(_sel->offIndex + (uint32_t)rank * kTileEntrySize) ||
-            _file.read(entry, kTileEntrySize) != (int)kTileEntrySize) {
-            return false;
+        // Big index: read a whole window of consecutive entries instead of the
+        // single one, aligned to the window so neighbours share it.  Panning
+        // walks the ranks in order, so this turns thousands of 8-byte reads
+        // into a handful of 4 KB ones.
+        if (!_entryCache) {   // no PSRAM for the window: one read per tile
+            if (!_file.seek(_sel->offIndex + (uint32_t)rank * kTileEntrySize) ||
+                _file.read(entry, kTileEntrySize) != (int)kTileEntrySize) {
+                return false;
+            }
+        } else {
+            const uint32_t first = rank & ~(uint32_t)(kEntryCacheEntries - 1);
+            const uint32_t available = _sel->info.present - first;
+            const uint16_t count = (uint16_t)std::min<uint32_t>(
+                kEntryCacheEntries, available);
+            if (!_file.seek(_sel->offIndex + (uint32_t)first * kTileEntrySize) ||
+                _file.read(_entryCache, (size_t)count * kTileEntrySize) != (int)(count * kTileEntrySize)) {
+                return false;
+            }
+            _entryCacheFirst = first;
+            _entryCacheCount = count;
+            memcpy(entry, _entryCache + (size_t)(rank - first) * kTileEntrySize, kTileEntrySize);
+#ifdef MONOMESH_MAP_CACHE_DEBUG
+            ++_cacheMisses;
+#endif
         }
     }
     offset = rd32(entry);
@@ -402,6 +451,87 @@ bool MapPack::readTile(int x, int y, uint8_t* out, size_t outCap, size_t& outLen
         ESP_LOGW(TAG, "inflate tile %d/%d/%d: status %d, %u bytes (expected %u)",
                  (int)(_sel ? _sel->info.z : 0), x, y, (int)status, (unsigned)produced,
                  (unsigned)packedTileBytes());
+        return false;
+    }
+    outLen = produced;
+    return true;
+}
+
+uint8_t MapPack::zoomBits(int z) const {
+    const ZoomRec* rec = findZoomRec(z);
+    return rec ? rec->info.bits : 0;
+}
+
+bool MapPack::tileAtZoom(int z, int x, int y, uint32_t& offset, uint16_t& length,
+                         uint16_t& flags) const {
+    if (_sel && _sel->info.z == z) return tileAt(x, y, offset, length, flags);
+    offset = 0;
+    length = 0;
+    flags = 0;
+    const ZoomRec* rec = findZoomRec(z);
+    if (!rec || !_file) return false;
+    const ZoomInfo& info = rec->info;
+    if (x < (int)info.x0 || y < (int)info.y0) return false;
+    const uint32_t lx = (uint32_t)x - info.x0;
+    const uint32_t ly = (uint32_t)y - info.y0;
+    if (lx >= info.nx || ly >= info.ny) return false;
+    const uint32_t bit = ly * info.nx + lx;
+    uint8_t byte = 0;
+    if (!_file.seek(rec->offPresence + (bit >> 3)) || _file.read(&byte, 1) != 1) return false;
+    if (!(byte & (0x80 >> (bit & 7)))) return false;
+    uint8_t word[4];
+    if (!_file.seek(rec->offPrefix + ly * 4) || _file.read(word, 4) != 4) return false;
+    uint32_t rank = rd32(word);
+    // Popcount of the presence row before the tile, read in small chunks: this
+    // path is only used by the overzoom fallback, never while panning.
+    const uint32_t rowStart = ly * info.nx;
+    uint32_t i = rowStart;
+    uint8_t chunk[64];
+    while (i < bit) {
+        const uint32_t bits = std::min<uint32_t>(sizeof(chunk) * 8, bit - i);
+        const uint32_t bytes = (bits + 7) / 8;
+        if (!_file.seek(rec->offPresence + (i >> 3)) ||
+            _file.read(chunk, bytes) != (int)bytes) {
+            return false;
+        }
+        for (uint32_t b = 0; b < bits; ++b) {
+            if (chunk[b >> 3] & (0x80 >> (b & 7))) ++rank;
+        }
+        i += bits;
+    }
+    if (rank >= info.present) return false;
+    uint8_t entry[kTileEntrySize];
+    if (!_file.seek(rec->offIndex + (uint32_t)rank * kTileEntrySize) ||
+        _file.read(entry, kTileEntrySize) != (int)kTileEntrySize) {
+        return false;
+    }
+    offset = rd32(entry);
+    length = rd16(entry + 4);
+    flags = rd16(entry + 6);
+    return true;
+}
+
+bool MapPack::readTileZoom(int z, int x, int y, uint8_t* out, size_t outCap, size_t& outLen) {
+    outLen = 0;
+    uint32_t offset = 0;
+    uint16_t length = 0, flags = 0;
+    if (!tileAtZoom(z, x, y, offset, length, flags)) return false;
+    if ((flags & kTileFlagBlank) || length == 0) return false;
+    const ZoomRec* rec = findZoomRec(z);
+    if (!rec || !out || !_scratch || length > _scratchCap || !_inflate) return false;
+    const size_t expected = (size_t)_tilePx * _tilePx * rec->info.bits / 8;
+    if (outCap < expected) return false;
+    if (!_file.seek(offset) || _file.read(_scratch, length) != (int)length) return false;
+    auto* inflate = (tinfl_decompressor*)_inflate;
+    tinfl_init(inflate);
+    size_t inLen = length;
+    size_t produced = outCap;
+    const tinfl_status status = tinfl_decompress(
+        inflate, _scratch, &inLen, out, out, &produced,
+        TINFL_FLAG_PARSE_ZLIB_HEADER | TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF);
+    if (status != TINFL_STATUS_DONE || produced != expected) {
+        ESP_LOGW(TAG, "overzoom inflate %d/%d/%d: status %d, %u bytes (expected %u)",
+                 z, x, y, (int)status, (unsigned)produced, (unsigned)expected);
         return false;
     }
     outLen = produced;

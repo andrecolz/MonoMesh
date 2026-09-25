@@ -412,6 +412,7 @@ bool StorageManager::loadSettings(SettingsConfig& cfg) {
         cfg.antiGhostThreshold = _pref.getUShort("antiGhost", cfg.antiGhostThreshold);
         cfg.clockLandscape = _pref.getBool("clockLand", true);
         cfg.clockFlip180 = _pref.getBool("clockFlip", false);
+        cfg.mapDarkTheme = _pref.getBool("mapDark", false);
 
         cfg.nodeRole = _pref.getUChar("nodeRole", 0);
         cfg.nodeInfoIntervalSec = _pref.getUInt("niIntSec", 10800);
@@ -574,6 +575,8 @@ bool StorageManager::loadSettingsFromConfigJson(SettingsConfig& cfg) {
             cfg.clockLandscape = (v == "true");
         } else if (jsonLineValue(line, "clockFlip180", v)) {
             cfg.clockFlip180 = (v == "true");
+        } else if (jsonLineValue(line, "mapDarkTheme", v)) {
+            cfg.mapDarkTheme = (v == "true");
         } else if (jsonLineValue(line, "nodeRole", v)) {
             cfg.nodeRole = (uint8_t)v.toInt();
         } else if (jsonLineValue(line, "antiGhostThreshold", v)) {
@@ -871,6 +874,7 @@ bool StorageManager::saveSettings(const SettingsConfig& cfg) {
     chk(_pref.putUShort("antiGhost", cfg.antiGhostThreshold) == 2);
     chk(_pref.putBool("clockLand", cfg.clockLandscape) == 1);
     chk(_pref.putBool("clockFlip", cfg.clockFlip180) == 1);
+    chk(_pref.putBool("mapDark", cfg.mapDarkTheme) == 1);
 
     chk(_pref.putUChar("nodeRole", cfg.nodeRole) == 1);
     chk(_pref.putUInt("niIntSec", cfg.nodeInfoIntervalSec) == 4);
@@ -949,6 +953,7 @@ bool StorageManager::saveSettings(const SettingsConfig& cfg) {
             jput(f.printf("  \"antiGhostThreshold\": %u,\n", cfg.antiGhostThreshold));
             jput(f.printf("  \"clockLandscape\": %s,\n", cfg.clockLandscape ? "true" : "false"));
             jput(f.printf("  \"clockFlip180\": %s,\n", cfg.clockFlip180 ? "true" : "false"));
+            jput(f.printf("  \"mapDarkTheme\": %s,\n", cfg.mapDarkTheme ? "true" : "false"));
             jput(f.printf("  \"nodeRole\": %u,\n", cfg.nodeRole));
             jput(f.printf("  \"nodeInfoIntervalSec\": %u,\n", (unsigned)cfg.nodeInfoIntervalSec));
             jput(f.printf("  \"telemetryIntervalSec\": %u,\n", (unsigned)cfg.telemetryIntervalSec));

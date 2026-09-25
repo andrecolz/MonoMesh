@@ -71,6 +71,8 @@ private:
     enum SlotState : uint8_t {
         SLOT_EMPTY = 0,
         SLOT_PACKED,        // packed monochrome bits from the container
+        SLOT_OVERZOOM,      // packed bits of a parent tile, blitted scaled up
+        SLOT_HATCH,         // no data anywhere: diagonal "out of coverage" pattern
         SLOT_PNG,           // legacy PNG bytes
         SLOT_BLANK_WHITE,   // tile exists but is empty: fill with white
         SLOT_BLANK_BLACK,   // ... or black (dark style)
@@ -84,10 +86,18 @@ private:
         uint8_t state = SLOT_EMPTY;
         uint8_t* data = nullptr; // PSRAM: packed bits or PNG bytes, depending on the state
         size_t len = 0;
+        uint8_t overzoom = 0;    // SLOT_OVERZOOM: 2^overzoom = scale (parent -> child)
+        uint8_t srcBits = 1;     // SLOT_OVERZOOM: packed bits of the parent tile
+        uint16_t srcPx = 0;      // SLOT_OVERZOOM: parent tile size in pixels
     };
 
     // ---- region / container ----
     MapPack _pack;
+    // Global z0-7 courtesy basemap (optional): the fallback for areas no region
+    // covers, opened on its own so it never disturbs the region selection.
+    MapPack _basemap;
+    bool _useBasemap = false;
+    static constexpr int kOverzoomLevels = 4;   // parent levels tried by the fallback
     std::vector<std::string> _regions;
     size_t _regionIndex = 0;
     bool _usePack = false;
@@ -164,6 +174,11 @@ private:
     int acquireTileSlot(int z, int x, int y);
     bool loadSlot(int slot, int z, int x, int y);
     void blitSlot(int slot, int canvasX, int canvasY);
+    // Fallback for a tile no container has: a parent level of the same
+    // container, then the basemap, then the hatch (see loadSlot).
+    void openBasemap();
+    bool loadOverzoom(int slot, MapPack& pack, bool primary, int z, int x, int y,
+                      int maxLevels);
 
     // Web Mercator helpers (same scheme as /tiles/z/x/y.png)
     static void latLonToTile(double lat, double lon, int z, double& tx, double& ty);

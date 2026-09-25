@@ -5,3 +5,4 @@ osmium>=3.6
 rich>=13.0
 requests>=2.31
 pyserial>=3.5
+pyshp>=2.3
