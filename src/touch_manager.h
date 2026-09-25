@@ -60,6 +60,8 @@ private:
     int16_t _downX = 0;
     int16_t _downY = 0;
     uint32_t _downTime = 0;
+    uint16_t _downId = 0;         // FT6336 contact id of the tracked press (FT5x06: P1_YH >> 4)
+    uint32_t _lostTouchSince = 0; // first poll with INT still asserted but zero contacts (I2C glitch)
     uint32_t _lastM5PollMs = 0;   // keep-alive cadence for M5.update() when the panel is idle
     uint32_t _lastIntLowMs = 0;   // last time TOUCH_INT was seen asserted
 

@@ -263,7 +263,11 @@ void ViewAlarm::applyEdit() {
         return;
     }
     svc.updateAlarm((size_t)_editIndex, _draft);
-    _draft = svc.alarms()[(size_t)_editIndex]; // sanitized copy
+    // Only refresh the draft when the update landed: if the alarm vanished from the list while its
+    // editor was open (external clear), indexing _alarms[_editIndex] would read past the vector.
+    if (_editIndex < (int)svc.alarms().size()) {
+        _draft = svc.alarms()[(size_t)_editIndex]; // sanitized copy
+    }
     markSavePending();
 }
 
@@ -316,7 +320,9 @@ void ViewAlarm::drawList(M5GFX& gfx) {
         gfx.fillRoundRect(CONTENT_X + 2, y + 2, CONTENT_W - 4, CARD_H - 4, 4, bg);
 
         char name[24];
-        snprintf(name, sizeof(name), "%.18s", a.name);
+        char cleanName[24];
+        sanitizeDisplayText(a.name, cleanName, sizeof(cleanName));
+        snprintf(name, sizeof(name), "%.18s", cleanName[0] ? cleanName : "ALARM");
         gfx.setTextColor(fg, bg);
         gfx.setTextDatum(textdatum_t::middle_left);
         gfx.setTextSize(2);
@@ -357,9 +363,13 @@ void ViewAlarm::drawEditor(M5GFX& gfx) {
         r.y = ys[i];
         r.h = hs[i];
         switch (kinds[i]) {
-            case EditRow::Name:
-                valueRow(gfx, r, "Name", _draft.name);
+            case EditRow::Name: {
+                // The name can come from alarms.txt/NVS (hand-editable): never draw raw bytes.
+                char cleanName[24];
+                sanitizeDisplayText(_draft.name, cleanName, sizeof(cleanName));
+                valueRow(gfx, r, "Name", cleanName[0] ? cleanName : "ALARM");
                 break;
+            }
             case EditRow::Time:
                 snprintf(value, sizeof(value), "%02u:%02u", (unsigned)_draft.hour, (unsigned)_draft.minute);
                 valueRow(gfx, r, "Time", value);

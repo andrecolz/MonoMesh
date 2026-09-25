@@ -43,6 +43,9 @@ constexpr size_t kZoomHeaderSize = 64;
 constexpr size_t kTileEntrySize = 8;
 constexpr uint32_t kSecZoom = 1;
 constexpr uint16_t kTileFlagBlank = 1 << 0;
+constexpr uint32_t kMaxTilePx = 4096;   // the panel is 480 px and the generator writes 256
+constexpr uint8_t kMaxZoom = 30;        // keeps "1 << z" defined in every consumer
+constexpr uint64_t kMaxCells = 16ULL * 1024 * 1024;
 
 uint32_t rd32(const uint8_t* p) { return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24); }
 uint16_t rd16(const uint8_t* p) { return (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8)); }
@@ -129,7 +132,7 @@ bool MapPack::open(const char* path) {
     const uint16_t sectionCount = rd16(head + 22);
     const uint32_t tableOff = rd32(head + 24);
     const uint32_t fileSize = rd32(head + 28);
-    if (version != kVersion || _bits < 1 || _bits > 2 || _tilePx == 0) {
+    if (version != kVersion || _bits < 1 || _bits > 2 || _tilePx == 0 || _tilePx > kMaxTilePx) {
         setError("unsupported .mmap version/format");
         close();
         return false;
@@ -179,20 +182,36 @@ bool MapPack::open(const char* path) {
         rec.info.nx = rd32(zhead + 8);
         rec.info.y0 = rd32(zhead + 12);
         rec.info.ny = rd32(zhead + 16);
-        rec.offPresence = off + rd32(zhead + 20);
-        rec.offPrefix = off + rd32(zhead + 24);
-        rec.offIndex = off + rd32(zhead + 28);
-        rec.offPayload = rd32(zhead + 32);
         rec.info.payloadBytes = rd32(zhead + 36);
         rec.info.present = rd32(zhead + 40);
-        // Corrupt-header guard: nx*ny can overflow 32-bit math (65536x65536 wraps to 0) and both
-        // `present` and the section offsets were never checked, so a truncated/hand-edited .mmap
-        // would make loadIndex()/tileAt() read out of bounds. Validate before keeping the record.
+        // Corrupt-header guard: nx*ny can overflow 32-bit math (65536x65536 wraps to 0) and the
+        // section offsets are relative to a 32-bit base, so both the multiplication and every sum
+        // are done in 64 bits: a wrapped value would slip past the checks below and make
+        // loadIndex()/tileAt() read out of bounds. Validate everything before keeping the record.
+        const uint64_t realSize = (uint64_t)_file.size();
         const uint64_t cells = (uint64_t)rec.info.nx * (uint64_t)rec.info.ny;
-        const uint32_t realSize = (uint32_t)_file.size();
-        if (rec.info.nx == 0 || rec.info.ny == 0 || cells > 16ULL * 1024 * 1024) continue;
+        if (rec.info.z > kMaxZoom || rec.info.bits < 1 || rec.info.bits > 2) continue;
+        if (rec.info.nx == 0 || rec.info.ny == 0 || cells > kMaxCells) continue;
         if ((uint64_t)rec.info.present > cells) continue;
-        if (rec.offPresence >= realSize || rec.offPrefix >= realSize || rec.offIndex >= realSize) continue;
+        // Tile coordinates live in [0, 2^z): a hand-edited x0/nx would otherwise overflow the int
+        // casts in the view (selectedCentre) and the bounds arithmetic in tileAt().
+        const uint64_t gridLimit = 1ULL << rec.info.z;
+        if ((uint64_t)rec.info.x0 + rec.info.nx > gridLimit ||
+            (uint64_t)rec.info.y0 + rec.info.ny > gridLimit) continue;
+        const uint64_t offPresence = (uint64_t)off + rd32(zhead + 20);
+        const uint64_t offPrefix = (uint64_t)off + rd32(zhead + 24);
+        const uint64_t offIndex = (uint64_t)off + rd32(zhead + 28);
+        const uint64_t offPayload = rd32(zhead + 32);
+        // The presence bitmap, the row prefix, the tile table and the payload must all be inside
+        // the real file, otherwise the reads in loadIndex()/readTile() would run past its end.
+        if (offPresence + (cells + 7) / 8 > realSize) continue;
+        if (offPrefix + ((uint64_t)rec.info.ny + 1) * 4 > realSize) continue;
+        if (offIndex + (uint64_t)rec.info.present * kTileEntrySize > realSize) continue;
+        if (rec.info.payloadBytes != 0 && offPayload + rec.info.payloadBytes > realSize) continue;
+        rec.offPresence = (uint32_t)offPresence;
+        rec.offPrefix = (uint32_t)offPrefix;
+        rec.offIndex = (uint32_t)offIndex;
+        rec.offPayload = (uint32_t)offPayload;
         _zooms.push_back(rec);
     }
     if (_zooms.empty()) {
@@ -202,6 +221,11 @@ bool MapPack::open(const char* path) {
     }
     std::sort(_zooms.begin(), _zooms.end(),
               [](const ZoomRec& a, const ZoomRec& b) { return a.info.z < b.info.z; });
+    // Two sections for the same zoom would show up twice in zoomCount() and in the view's level
+    // list: keep the first one only (the writer never emits duplicates).
+    _zooms.erase(std::unique(_zooms.begin(), _zooms.end(),
+                             [](const ZoomRec& a, const ZoomRec& b) { return a.info.z == b.info.z; }),
+                 _zooms.end());
     ESP_LOGI(TAG, "%s: %u zoom (%d..%d), %u tile, %u bit/pixel", name,
              (unsigned)_zooms.size(), firstZoom(), lastZoom(),
              (unsigned)std::accumulate(_zooms.begin(), _zooms.end(), 0u,
@@ -241,7 +265,7 @@ bool MapPack::loadIndex(const ZoomRec& rec) {
     const uint64_t cells = (uint64_t)rec.info.nx * (uint64_t)rec.info.ny;
     const size_t presenceBytes = (size_t)((cells + 7) / 8);
     const size_t prefixBytes = ((size_t)rec.info.ny + 1) * 4;
-    if (presenceBytes > kIndexPsramLimit) {
+    if (presenceBytes > kIndexPsramLimit || prefixBytes > kIndexPsramLimit) {
         setError("presence map too large");
         return false;
     }
@@ -256,6 +280,25 @@ bool MapPack::loadIndex(const ZoomRec& rec) {
         !_file.seek(rec.offPrefix) || _file.read((uint8_t*)_prefix, prefixBytes) != (int)prefixBytes) {
         releaseIndex();
         setError("zoom index unreadable");
+        return false;
+    }
+    // tileAt() derives the index rank from the row prefix plus a bitmap popcount: validate the
+    // prefix against the presence bitmap before trusting it. A hand-edited/corrupt file could
+    // otherwise make the rank run away and, worse, turn every tile lookup into a long bitmap scan
+    // (selectedCentre() walks cells until the first hit). tools/mono_map.py always writes a
+    // cumulative prefix and a total equal to present_count.
+    uint64_t running = 0;
+    for (uint32_t y = 0; y < rec.info.ny; ++y) {
+        if (_prefix[y] != running) {
+            releaseIndex();
+            setError("zoom row prefix inconsistent");
+            return false;
+        }
+        running += popcountRange(_presence, y * rec.info.nx, (y + 1) * rec.info.nx);
+    }
+    if ((uint64_t)_prefix[rec.info.ny] != running || running != rec.info.present) {
+        releaseIndex();
+        setError("zoom index count mismatch");
         return false;
     }
     if (rec.info.present > 0) {
@@ -312,8 +355,12 @@ bool MapPack::tileAt(int x, int y, uint32_t& offset, uint16_t& length, uint16_t&
     const uint32_t bit = ly * _sel->info.nx + lx;
     if (!(_presence[bit >> 3] & (0x80 >> (bit & 7)))) return false;
 
-    int rank = (int)_prefix[ly] + popcountRange(_presence, ly * _sel->info.nx, bit);
-    if (rank < 0 || (uint32_t)rank >= _sel->info.present) return false;
+    // Unsigned on purpose: a corrupt prefix must not overflow the signed rank (UB); the loaded
+    // index is validated, but tileAt() also guards the sum with the present count.
+    const uint32_t base = _prefix[ly];
+    if (base > _sel->info.present) return false;
+    const uint32_t rank = base + (uint32_t)popcountRange(_presence, ly * _sel->info.nx, bit);
+    if (rank >= _sel->info.present) return false;
     uint8_t entry[kTileEntrySize];
     if (_index && _indexCount > 0) {
         memcpy(entry, _index + (size_t)rank * kTileEntrySize, kTileEntrySize);
@@ -374,8 +421,10 @@ bool MapPack::selectedBounds(double& minLat, double& minLon, double& maxLat, dou
     if (!_sel) return false;
     const int z = _sel->info.z;
     double lat1, lon1, lat2, lon2;
-    tileToLatLon(_sel->info.x0, _sel->info.y0, z, lat1, lon1);
-    tileToLatLon(_sel->info.x0 + _sel->info.nx, _sel->info.y0 + _sel->info.ny, z, lat2, lon2);
+    // Cast before adding: x0 + nx as uint32 can wrap for a corrupt record.
+    tileToLatLon((double)_sel->info.x0, (double)_sel->info.y0, z, lat1, lon1);
+    tileToLatLon((double)_sel->info.x0 + (double)_sel->info.nx,
+                 (double)_sel->info.y0 + (double)_sel->info.ny, z, lat2, lon2);
     minLat = std::min(lat1, lat2);
     maxLat = std::max(lat1, lat2);
     minLon = std::min(lon1, lon2);
@@ -404,6 +453,10 @@ bool MapPack::selectedCentre(int& tileX, int& tileY) const {
 
 size_t MapPack::listRegions(std::vector<std::string>& out) {
     out.clear();
+    // A manipulated card can hold thousands of ".mmap" names: stop at a sane number so the vector
+    // of std::strings cannot exhaust the heap (the view cycles regions with a long press).
+    constexpr size_t kMaxRegions = 64;
+    bool full = false;
     // SD_MMC is already rooted at /sdcard, so "/sdcard/maps" resolved to /sdcard/sdcard/maps and
     // never matched anything: /maps is the only real root.
     File dir = SD_MMC.open("/maps");
@@ -417,9 +470,15 @@ size_t MapPack::listRegions(std::vector<std::string>& out) {
                 if (len > 5 && strcasecmp(base + len - 5, ".mmap") == 0) {
                     // std::string, not a fixed buffer: long region names were silently truncated.
                     out.push_back(std::string("/maps/") + base);
+                    if (out.size() >= kMaxRegions) {
+                        ESP_LOGW(TAG, "more than %u .mmap files in /maps: the rest is ignored",
+                                 (unsigned)kMaxRegions);
+                        full = true;
+                    }
                 }
             }
             entry.close();
+            if (full) break;
         }
     }
     if (dir) dir.close();

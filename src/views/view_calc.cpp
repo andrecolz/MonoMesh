@@ -278,22 +278,25 @@ int ViewCalc::digitsInCurrentNumber() const {
     return n;
 }
 
-void ViewCalc::startFreshIfResult() {
+void ViewCalc::startFreshIfResult(bool startNewNumber) {
     if (!_showingResult) return;
     _showingResult = false;
     _resultLine.clear();
-    if (_expr == "Error") _expr.clear();
+    // A digit or a dot starts a new calculation ("una cifra inizia un calcolo nuovo"): without
+    // clearing, typing '5' after "200+20=" produced "2205" instead of "5". An operator instead
+    // keeps the result and continues from it. "Error" is always cleared.
+    if (startNewNumber || _expr == "Error") _expr.clear();
 }
 
 void ViewCalc::appendDigit(char d) {
-    startFreshIfResult();
+    startFreshIfResult(true);
     if (_expr.size() >= MAX_EXPR) return;
     if (digitsInCurrentNumber() >= MAX_DIGITS) return;
     _expr += d;
 }
 
 void ViewCalc::appendOperator(char op) {
-    startFreshIfResult();
+    startFreshIfResult(false);
     if (_expr.size() >= MAX_EXPR) return;
     if (_expr.empty()) {
         if (op == '-') _expr += op; // leading unary minus
@@ -317,7 +320,7 @@ void ViewCalc::appendOperator(char op) {
 }
 
 void ViewCalc::appendDot() {
-    startFreshIfResult();
+    startFreshIfResult(true);
     if (_expr.size() >= MAX_EXPR) return;
     const char last = _expr.empty() ? '\0' : _expr.back();
     if (isDigitChar(last)) {
@@ -330,14 +333,14 @@ void ViewCalc::appendDot() {
 }
 
 void ViewCalc::appendPercent() {
-    startFreshIfResult();
+    startFreshIfResult(false);
     if (_expr.empty() || _expr.size() >= MAX_EXPR) return;
     const char last = _expr.back();
     if (isDigitChar(last) || last == ')' || last == '%') _expr += '%';
 }
 
 void ViewCalc::appendParen() {
-    startFreshIfResult();
+    startFreshIfResult(false);
     if (_expr.size() >= MAX_EXPR) return;
     const char last = _expr.empty() ? '\0' : _expr.back();
     const bool operandEnd = isDigitChar(last) || last == ')' || last == '%';

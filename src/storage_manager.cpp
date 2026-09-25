@@ -2,12 +2,129 @@
 #include "bsp_papermono.h"
 #include <SD_MMC.h>
 #include <FS.h>
+#include <ctype.h>
+#include <math.h>
 #include <esp_log.h>
 #include <sodium.h>
 
 static constexpr const char* TAG = "MonoMesh-Storage";
 
 namespace MonoMesh {
+
+namespace {
+// Hard caps for the files read back from the card: they are all tiny by design (the only unbounded
+// one is messages.csv, handled with a rolling window) and a corrupted/hand-crafted file must not be
+// able to make the firmware allocate for minutes or walk gigabytes.
+constexpr size_t MAX_SETTINGS_JSON_BYTES = 4 * 1024;
+constexpr size_t MAX_ALARMS_FILE_BYTES = 16 * 1024;
+constexpr size_t MAX_NODES_CSV_BYTES = 1024 * 1024;
+constexpr size_t MAX_CHAT_REWRITE_BYTES = 4 * 1024 * 1024;
+constexpr size_t MAX_CHAT_SCAN_BYTES = 512 * 1024;
+// Live chat keeps at most MAX_MESSAGES (50) per queue; restoring more than this only wastes heap.
+constexpr size_t MAX_RESTORED_CHAT_MESSAGES = 128;
+
+// Stream::readStringUntil() has no length cap: a file/line without newlines makes the String grow
+// until the heap is exhausted (or the watchdogs fire). Read at most maxLen chars, drain the rest of
+// an over-long line so the scan can continue, and report the line as invalid.
+bool readLineBounded(File& f, String& out, size_t maxLen) {
+    out = "";
+    bool overflow = false;
+    while (f.available()) {
+        const int c = f.read();
+        if (c < 0) break;
+        if (c == '\n') break;
+        if (c == '\r') continue;
+        if (out.length() >= maxLen) {
+            overflow = true;
+            continue;
+        }
+        out += (char)c;
+    }
+    return !overflow;
+}
+
+// Strict hex decode. sscanf("%02x") silently yields 0 for any non-hex char, so a corrupt CSV row
+// could inject an all-zero public key/MAC that looks valid. Returns false on bad length/digits.
+bool hexToBytes(const char* hex, size_t outLen, uint8_t* out) {
+    if (!hex || !out || strlen(hex) != outLen * 2) return false;
+    for (size_t i = 0; i < outLen * 2; ++i) {
+        if (!isxdigit((unsigned char)hex[i])) return false;
+    }
+    for (size_t i = 0; i < outLen; ++i) {
+        const char pair[3] = {hex[i * 2], hex[i * 2 + 1], '\0'};
+        out[i] = (uint8_t)strtoul(pair, nullptr, 16);
+    }
+    return true;
+}
+
+// config.json is written line by line with a plain %s: a double quote, backslash or newline in a
+// user-provided name would break the file and make the NVS recovery path restore a truncated (or
+// mis-parsed) configuration.
+void sanitizeJsonString(const char* in, char* out, size_t cap) {
+    if (!out || cap == 0) return;
+    if (!in) {
+        out[0] = '\0';
+        return;
+    }
+    size_t j = 0;
+    for (size_t i = 0; in[i] != '\0' && j + 1 < cap; ++i) {
+        char c = in[i];
+        if (c == '"') c = '\'';
+        else if (c == '\\') c = '/';
+        else if (c == '\n' || c == '\r' || c == '\t') c = ' ';
+        else if ((unsigned char)c < 0x20) continue;
+        out[j++] = c;
+    }
+    out[j] = '\0';
+}
+
+// A corrupt NVS blob or a hand-edited config.json must not configure values outside the ranges the
+// radio stack, the UI and the schedulers accept. Applied on every LOAD path (saves keep the RAM
+// value: it has already gone through the setters) and only here, so disk/NVS layouts are untouched.
+void sanitizeSettings(SettingsConfig& cfg) {
+    if (cfg.txPower < -3) cfg.txPower = -3;            // same clamp as setTxPower()/applyRadioConfig()
+    if (cfg.txPower > 22) cfg.txPower = 22;
+    if (!(cfg.frequency >= 150.0f && cfg.frequency <= 960.0f)) cfg.frequency = 869.525f; // SX1262 range
+    if (cfg.modemPreset > 6) cfg.modemPreset = 4;      // MediumFast (EU868 default)
+    if (cfg.hopLimit < 1) cfg.hopLimit = 1;
+    if (cfg.hopLimit > 7) cfg.hopLimit = 7;
+    if (cfg.frontlight > 100) cfg.frontlight = 100;
+    if (cfg.powerBtnAction > 3) cfg.powerBtnAction = 1; // Standby
+    if (cfg.nodeRole > 2) cfg.nodeRole = 0;            // CLIENT
+    // seconds * 1000 must not overflow the uint32 millis math in mesh_service
+    if (cfg.nodeInfoIntervalSec > 604800UL) cfg.nodeInfoIntervalSec = 604800UL;
+    if (cfg.telemetryIntervalSec > 604800UL) cfg.telemetryIntervalSec = 604800UL;
+    if (cfg.positionIntervalSec > 604800UL) cfg.positionIntervalSec = 604800UL;
+    if (cfg.neighborInfoIntervalSec > 604800UL) cfg.neighborInfoIntervalSec = 604800UL;
+    if (cfg.dutyCyclePct > 100) cfg.dutyCyclePct = 0;  // 0 = region default
+    if (cfg.rebroadcastMode > 2) cfg.rebroadcastMode = 0;
+    if (cfg.buzzerMode > 4) cfg.buzzerMode = 0;
+    if (cfg.buzzerVolume > 3) cfg.buzzerVolume = 3;
+    if (cfg.timezoneOffset < -12) cfg.timezoneOffset = -12;
+    if (cfg.timezoneOffset > 14) cfg.timezoneOffset = 14;
+    if (cfg.primaryPskLen != 0 && cfg.primaryPskLen != 16 && cfg.primaryPskLen != 32) cfg.primaryPskLen = 16;
+    if (cfg.learnedChanKeyLen != 0 && cfg.learnedChanKeyLen != 16 && cfg.learnedChanKeyLen != 32) {
+        cfg.learnedChanKeyLen = 0;
+    }
+    if (cfg.learnedChanKeyLen == 0) cfg.learnedChanValid = false;
+    // Force NUL termination on every fixed char array, whatever wrote the source blob.
+    cfg.longName[sizeof(cfg.longName) - 1] = '\0';
+    cfg.shortName[sizeof(cfg.shortName) - 1] = '\0';
+    cfg.primaryChannelName[sizeof(cfg.primaryChannelName) - 1] = '\0';
+    if (cfg.secondaryChannelCount > 7) cfg.secondaryChannelCount = 7;
+    uint8_t keptCh = 0;
+    for (uint8_t i = 0; i < cfg.secondaryChannelCount; ++i) {
+        ChannelConfig& ch = cfg.secondaryChannels[i];
+        ch.name[sizeof(ch.name) - 1] = '\0';
+        // Only 0/16/32 are legal Meshtastic key lengths: drop a channel whose key is unusable
+        // instead of feeding it to the hash/AES paths.
+        if (ch.pskLen != 0 && ch.pskLen != 16 && ch.pskLen != 32) continue;
+        if (keptCh != i) cfg.secondaryChannels[keptCh] = ch;
+        ++keptCh;
+    }
+    cfg.secondaryChannelCount = keptCh;
+}
+} // namespace
 
 bool StorageManager::init() {
     ESP_LOGI(TAG, "Initializing Storage Subsystem (NVS + MicroSD)...");
@@ -47,6 +164,13 @@ bool StorageManager::init() {
     }
 
     initSdCard();
+    if (_sdMounted) {
+        // Promote/clean the *.tmp files left by interrupted atomic swaps before anything reads them.
+        recoverTempFile("/monomesh/config.json.tmp", "/monomesh/config.json", MAX_SETTINGS_JSON_BYTES);
+        recoverTempFile("/monomesh/nodes.csv.tmp", "/monomesh/nodes.csv", MAX_NODES_CSV_BYTES);
+        recoverTempFile("/monomesh/alarms.tmp", "/monomesh/alarms.txt", MAX_ALARMS_FILE_BYTES);
+        recoverTempFile("/monomesh/messages.tmp", "/monomesh/messages.csv", MAX_CHAT_REWRITE_BYTES);
+    }
     // History cleared while no card was in: apply it now that the FAT is back (see clearChatHistory)
     if (_sdMounted && _pref.getBool("chatClrPend", false)) {
         SD_MMC.remove("/monomesh/messages.csv");
@@ -62,6 +186,7 @@ bool StorageManager::init() {
 }
 
 bool StorageManager::initSdCard() {
+    if (_sdMounted) return true;   // idempotent: never re-begin an already mounted FAT
     auto& ioe1 = BSP::getInstance().getIOE1();
 
     ioe1.pinMode(IOEPins::TF_EN, OUTPUT);
@@ -73,7 +198,10 @@ bool StorageManager::initSdCard() {
     int detVal = ioe1.digitalRead(IOEPins::TF_DET);
     if (detVal != 0) {
         ESP_LOGI(TAG, "MicroSD slot empty (TF_DET HIGH)");
+        SD_MMC.end();   // no-op when never mounted; releases the driver if the card was pulled hot
         _sdMounted = false;
+        _sdTotalBytes = 0;
+        _sdFreeBytes = 0;
         return false;
     }
 
@@ -86,14 +214,18 @@ bool StorageManager::initSdCard() {
         ESP_LOGW(TAG, "SD_MMC 4-bit mount failed, trying 1-bit mode...");
         if (!SD_MMC.begin("/sdcard", true, false, SDMMC_FREQ_DEFAULT, 5)) {
             ESP_LOGE(TAG, "SD_MMC mount failed entirely!");
+            SD_MMC.end();   // clear any half-open driver state so a later retry starts clean
             _sdMounted = false;
+            _sdTotalBytes = 0;
+            _sdFreeBytes = 0;
             return false;
         }
     }
 
     _sdMounted = true;
     _sdTotalBytes = SD_MMC.totalBytes();
-    _sdFreeBytes = _sdTotalBytes - SD_MMC.usedBytes();
+    const uint64_t used = SD_MMC.usedBytes();
+    _sdFreeBytes = (used <= _sdTotalBytes) ? (_sdTotalBytes - used) : 0;   // FAT readback can race
 
     ESP_LOGI(TAG, "MicroSD mounted successfully! Total: %llu MB, Free: %llu MB",
              _sdTotalBytes / (1024 * 1024), _sdFreeBytes / (1024 * 1024));
@@ -123,6 +255,36 @@ bool StorageManager::initSdCard() {
     return true;
 }
 
+// A *.tmp left behind means the remove+rename swap was interrupted (power cut, card pulled). If the
+// final file is missing and the tmp looks complete (non-empty, within bound, last byte is the
+// newline every writer always terminates with) it is promoted; otherwise it is a truncated write and
+// is deleted. Called on every mount so no half-written file is ever parsed as authoritative.
+void StorageManager::recoverTempFile(const char* tmpPath, const char* finalPath, size_t maxBytes) {
+    if (!_sdMounted || !SD_MMC.exists(tmpPath)) return;
+    if (SD_MMC.exists(finalPath)) {
+        SD_MMC.remove(tmpPath);   // the final file is the good one: the tmp is stale
+        return;
+    }
+    bool complete = false;
+    size_t sz = 0;
+    File f = SD_MMC.open(tmpPath, FILE_READ);
+    if (f) {
+        sz = f.size();
+        if (sz > 0 && sz <= maxBytes) {
+            f.seek(sz - 1);
+            const int last = f.read();
+            complete = (last == '\n');
+        }
+        f.close();
+    }
+    if (complete && SD_MMC.rename(tmpPath, finalPath)) {
+        ESP_LOGW(TAG, "Recovered %s from an interrupted write (%u bytes)", finalPath, (unsigned)sz);
+    } else {
+        SD_MMC.remove(tmpPath);
+        ESP_LOGW(TAG, "Removed incomplete %s (%u bytes)", tmpPath, (unsigned)sz);
+    }
+}
+
 bool StorageManager::unmountSd() {
     if (!_sdMounted) return true;
     // Whoever holds an open handle (the map container) must let go first: after
@@ -140,6 +302,11 @@ bool StorageManager::remountSd() {
     if (_sdMounted) return true;
     ESP_LOGI(TAG, "Remounting MicroSD after standby...");
     if (!initSdCard()) return false;
+    // Same temp-file recovery as init(): a card pulled during a write can leave a .tmp behind.
+    recoverTempFile("/monomesh/config.json.tmp", "/monomesh/config.json", MAX_SETTINGS_JSON_BYTES);
+    recoverTempFile("/monomesh/nodes.csv.tmp", "/monomesh/nodes.csv", MAX_NODES_CSV_BYTES);
+    recoverTempFile("/monomesh/alarms.tmp", "/monomesh/alarms.txt", MAX_ALARMS_FILE_BYTES);
+    recoverTempFile("/monomesh/messages.tmp", "/monomesh/messages.csv", MAX_CHAT_REWRITE_BYTES);
     // History cleared while no card was in: apply it before the flush repopulates the CSV.
     if (_pref.getBool("chatClrPend", false)) {
         SD_MMC.remove("/monomesh/messages.csv");
@@ -179,7 +346,10 @@ bool StorageManager::getPkiKeyPair(uint8_t pubKey[32], uint8_t privKey[32]) {
             // public key: both read back "valid" but every incoming DM stops decrypting. Check that
             // the public key really derives from the private one before trusting the pair.
             uint8_t derived[32] = {0};
-            if (crypto_scalarmult_base(derived, privKey) == 0 && memcmp(derived, pubKey, 32) == 0) {
+            const bool consistent = (crypto_scalarmult_base(derived, privKey) == 0 &&
+                                     memcmp(derived, pubKey, 32) == 0);
+            sodium_memzero(derived, sizeof(derived));
+            if (consistent) {
                 ESP_LOGI(TAG, "Loaded existing PKI keypair from NVS");
                 return true;
             }
@@ -261,6 +431,7 @@ bool StorageManager::loadSettings(SettingsConfig& cfg) {
                 char k[16];
                 snprintf(k, sizeof(k), "ch_%u", (unsigned)i);
                 ChannelConfig tmp = {};
+                if (!_pref.isKey(k)) continue;   // missing key: getBytes() would only log a len fail
                 if (_pref.getBytes(k, &tmp, sizeof(ChannelConfig)) == sizeof(ChannelConfig)) {
                     cfg.secondaryChannels[cfg.secondaryChannelCount++] = tmp;
                 }
@@ -281,7 +452,8 @@ bool StorageManager::loadSettings(SettingsConfig& cfg) {
         }
         memset(cfg.primaryPsk, 0, sizeof(cfg.primaryPsk));
         if (cfg.primaryPskLen > 0) {
-            if (_pref.getBytes("ch0Psk", cfg.primaryPsk, cfg.primaryPskLen) != cfg.primaryPskLen) {
+            if (!_pref.isKey("ch0Psk") ||
+                _pref.getBytes("ch0Psk", cfg.primaryPsk, cfg.primaryPskLen) != cfg.primaryPskLen) {
                 const uint8_t defKey[16] = {0xd4,0xf1,0xbb,0x3a,0x20,0x29,0x07,0x59,0xf0,0xbc,0xff,0xab,0xcf,0x4e,0x69,0x01};
                 memcpy(cfg.primaryPsk, defKey, 16);
                 cfg.primaryPskLen = 16;
@@ -303,7 +475,8 @@ bool StorageManager::loadSettings(SettingsConfig& cfg) {
         }
         memset(cfg.learnedChanKey, 0, sizeof(cfg.learnedChanKey));
         if (cfg.learnedChanKeyLen > 0) {
-            if (_pref.getBytes("lcKey", cfg.learnedChanKey, cfg.learnedChanKeyLen) != cfg.learnedChanKeyLen) {
+            if (!_pref.isKey("lcKey") ||
+                _pref.getBytes("lcKey", cfg.learnedChanKey, cfg.learnedChanKeyLen) != cfg.learnedChanKeyLen) {
                 memset(cfg.learnedChanKey, 0, sizeof(cfg.learnedChanKey));
                 cfg.learnedChanKeyLen = 0;
                 cfg.learnedChanValid = false;
@@ -311,6 +484,9 @@ bool StorageManager::loadSettings(SettingsConfig& cfg) {
         }
         cfg.learnedChanHits = _pref.getUShort("lcHits", 0);
         cfg.meshTimeSync = _pref.getBool("meshTsync", true);
+
+        // Clamp every field read back from a possibly corrupt NVS partition.
+        sanitizeSettings(cfg);
 
         ESP_LOGI(TAG, "Loaded settings from NVS (Node: %s / %s, Freq: %.3f MHz, Pwr: %d dBm, FL: %u%%, PwrBtn: %u, Clock: %s%s, Role: %u, Led: %d, Vol: %u, Duty: %u%%, RBC: %u)",
                  cfg.shortName, cfg.longName, cfg.frequency, cfg.txPower, cfg.frontlight, cfg.powerBtnAction,
@@ -356,18 +532,31 @@ bool StorageManager::loadSettingsFromConfigJson(SettingsConfig& cfg) {
 
     File f = SD_MMC.open("/monomesh/config.json", FILE_READ);
     if (!f) return false;
+    if (f.size() > MAX_SETTINGS_JSON_BYTES) {
+        ESP_LOGW(TAG, "config.json is unexpectedly large (%u B): ignoring it", (unsigned)f.size());
+        f.close();
+        return false;
+    }
 
     bool gotIdentity = false;
+    String line;
     while (f.available()) {
-        String line = f.readStringUntil('\n');
+        if (!readLineBounded(f, line, 256)) {
+            ESP_LOGW(TAG, "config.json has an over-long line: ignoring the rest of the file");
+            break;
+        }
         String v;
         if (jsonLineValue(line, "longName", v)) {
             if (v.length() > 0) {
                 strncpy(cfg.longName, v.c_str(), sizeof(cfg.longName) - 1);
+                cfg.longName[sizeof(cfg.longName) - 1] = '\0';
                 gotIdentity = true;
             }
         } else if (jsonLineValue(line, "shortName", v)) {
-            if (v.length() > 0) strncpy(cfg.shortName, v.c_str(), sizeof(cfg.shortName) - 1);
+            if (v.length() > 0) {
+                strncpy(cfg.shortName, v.c_str(), sizeof(cfg.shortName) - 1);
+                cfg.shortName[sizeof(cfg.shortName) - 1] = '\0';
+            }
         } else if (jsonLineValue(line, "frequency", v)) {
             float fq = v.toFloat();
             if (fq > 100.0f && fq < 1000.0f) cfg.frequency = fq;
@@ -411,19 +600,24 @@ bool StorageManager::loadSettingsFromConfigJson(SettingsConfig& cfg) {
             cfg.timezoneOffset = (int8_t)v.toInt();
         } else if (jsonLineValue(line, "primaryChannelName", v)) {
             strncpy(cfg.primaryChannelName, v.c_str(), sizeof(cfg.primaryChannelName) - 1);
+            cfg.primaryChannelName[sizeof(cfg.primaryChannelName) - 1] = '\0';
         } else if (jsonLineValue(line, "primaryPskHex", v)) {
-            if (v.length() == 32 || v.length() == 64) {
-                uint8_t key[32] = {};
-                uint8_t keyLen = 0;
-                for (size_t i = 0; i + 1 < v.length(); i += 2) {
-                    key[keyLen++] = (uint8_t)strtoul(v.substring(i, i + 2).c_str(), nullptr, 16);
-                }
-                memcpy(cfg.primaryPsk, key, keyLen);
-                cfg.primaryPskLen = keyLen;
+            uint8_t key[32] = {};
+            if (v.length() == 32 && hexToBytes(v.c_str(), 16, key)) {
+                memcpy(cfg.primaryPsk, key, 16);
+                cfg.primaryPskLen = 16;
+            } else if (v.length() == 64 && hexToBytes(v.c_str(), 32, key)) {
+                memcpy(cfg.primaryPsk, key, 32);
+                cfg.primaryPskLen = 32;
+            } else if (v.length() > 0) {
+                ESP_LOGW(TAG, "config.json primaryPskHex is malformed: keeping the default key");
             }
+            sodium_memzero(key, sizeof(key));
         }
     }
     f.close();
+    // Hand-edited/truncated file: clamp every numeric field and force the string terminators.
+    sanitizeSettings(cfg);
     return gotIdentity;
 }
 
@@ -461,21 +655,44 @@ bool StorageManager::saveAlarmsFile(const std::vector<AlarmRecord>& alarms) {
         ESP_LOGW(TAG, "Could not open /monomesh/alarms.tmp for writing");
         return false;
     }
-    bool ok = f.printf("# MonoMesh alarms: enabled|powerWake|backlight|repeat|days|year|month|day|hour|minute|tone|name\n") > 0;
+    size_t expected = 0;
+    bool ok = false;
+    {
+        const size_t hdr = f.printf("# MonoMesh alarms: enabled|powerWake|backlight|repeat|days|year|month|day|hour|minute|tone|name\n");
+        expected += hdr;
+        ok = hdr > 0;
+    }
     size_t n = 0;
     for (const auto& a : alarms) {
         if (n++ >= MAX_ALARMS) break;
-        if (f.printf("%d|%d|%d|%u|%u|%u|%u|%u|%u|%u|%u|%s\n",
+        // The name is the last field and the reader splits on '|': sanitize it so a corrupt NVS blob
+        // cannot inject extra separators (which would make the alarm unparseable on the next boot).
+        char cleanName[sizeof(a.name)];
+        size_t j = 0;
+        for (size_t i = 0; a.name[i] != '\0' && j + 1 < sizeof(cleanName); ++i) {
+            char c = a.name[i];
+            if (c == '|' || c == '\n' || c == '\r' || c == '\t') c = ' ';
+            cleanName[j++] = c;
+        }
+        cleanName[j] = '\0';
+        const size_t w = f.printf("%d|%d|%d|%u|%u|%u|%u|%u|%u|%u|%u|%s\n",
                      a.enabled ? 1 : 0, a.powerWake ? 1 : 0, a.backlight ? 1 : 0, (unsigned)a.repeat,
                      (unsigned)a.daysMask, (unsigned)a.year, (unsigned)a.month, (unsigned)a.day,
-                     (unsigned)a.hour, (unsigned)a.minute, (unsigned)a.tone, a.name) <= 0) {
+                     (unsigned)a.hour, (unsigned)a.minute, (unsigned)a.tone, cleanName);
+        expected += w;
+        if (w == 0) {
             ok = false;
             break;
         }
     }
+    // size() reads the FAT directory entry, which the buffered writer only updates on sync: flush
+    // the tail first or a freshly written file always looks truncated.
+    f.flush();
+    const size_t actual = f.size();
     f.close();
-    if (!ok) {
-        ESP_LOGE(TAG, "Alarm file write failed (card full?): keeping the previous alarms.txt");
+    if (!ok || actual < expected) {
+        ESP_LOGE(TAG, "Alarm file write failed (%u/%u B, card full?): keeping the previous alarms.txt",
+                 (unsigned)actual, (unsigned)expected);
         SD_MMC.remove("/monomesh/alarms.tmp");
         return false;
     }
@@ -491,11 +708,22 @@ bool StorageManager::loadAlarmsFile(std::vector<AlarmRecord>& alarms) {
     if (!_sdMounted || !SD_MMC.exists("/monomesh/alarms.txt")) return false;
     File f = SD_MMC.open("/monomesh/alarms.txt", FILE_READ);
     if (!f) return false;
+    if (f.size() > MAX_ALARMS_FILE_BYTES) {
+        ESP_LOGW(TAG, "alarms.txt is unexpectedly large (%u B): ignoring it", (unsigned)f.size());
+        f.close();
+        return false;
+    }
 
     alarms.clear();
     bool sawHeader = false;
+    String line;
     while (f.available() && alarms.size() < MAX_ALARMS) {
-        String line = f.readStringUntil('\n');
+        if (!readLineBounded(f, line, 256)) {
+            ESP_LOGW(TAG, "alarms.txt has an over-long line: file looks corrupt, ignoring it");
+            alarms.clear();
+            f.close();
+            return false;
+        }
         line.trim();
         if (line.isEmpty()) continue;
         if (line.startsWith("#")) {
@@ -567,6 +795,7 @@ bool StorageManager::saveAlarmsNvs(const std::vector<AlarmRecord>& alarms) {
 }
 
 bool StorageManager::loadAlarmsNvs(std::vector<AlarmRecord>& alarms) {
+    if (!_pref.isKey("alarms")) return false;   // avoid a noisy nvs_get_blob len fail on a fresh unit
     const size_t len = _pref.getBytesLength("alarms");
     uint8_t buf[2 + MAX_ALARMS * sizeof(AlarmRecord)];
     if (len < 2 || len > sizeof(buf)) return false;
@@ -694,46 +923,66 @@ bool StorageManager::saveSettings(const SettingsConfig& cfg) {
 
     if (_sdMounted) {
         // Same tmp + rename swap as the other state files: this JSON is the NVS recovery source, a
-        // truncated copy would restore a half-written configuration at the next boot.
+        // truncated copy would restore a half-written configuration at the next boot. Every write is
+        // counted and the swap only happens when the whole file made it to the card.
         File f = SD_MMC.open("/monomesh/config.json.tmp", FILE_WRITE);
         if (f) {
-            f.printf("{\n");
-            f.printf("  \"longName\": \"%s\",\n", cfg.longName);
-            f.printf("  \"shortName\": \"%s\",\n", cfg.shortName);
-            f.printf("  \"frequency\": %.3f,\n", cfg.frequency);
-            f.printf("  \"txPower\": %d,\n", cfg.txPower);
-            f.printf("  \"modemPreset\": %u,\n", cfg.modemPreset);
-            f.printf("  \"hopLimit\": %u,\n", cfg.hopLimit);
-            f.printf("  \"frontlight\": %u,\n", cfg.frontlight);
-            f.printf("  \"powerBtnAction\": %u,\n", cfg.powerBtnAction);
-            f.printf("  \"antiGhostThreshold\": %u,\n", cfg.antiGhostThreshold);
-            f.printf("  \"clockLandscape\": %s,\n", cfg.clockLandscape ? "true" : "false");
-            f.printf("  \"clockFlip180\": %s,\n", cfg.clockFlip180 ? "true" : "false");
-            f.printf("  \"nodeRole\": %u,\n", cfg.nodeRole);
-            f.printf("  \"nodeInfoIntervalSec\": %u,\n", (unsigned)cfg.nodeInfoIntervalSec);
-            f.printf("  \"telemetryIntervalSec\": %u,\n", (unsigned)cfg.telemetryIntervalSec);
-            f.printf("  \"positionIntervalSec\": %u,\n", (unsigned)cfg.positionIntervalSec);
-            f.printf("  \"neighborInfoIntervalSec\": %u,\n", (unsigned)cfg.neighborInfoIntervalSec);
-            f.printf("  \"dutyCyclePct\": %u,\n", (unsigned)cfg.dutyCyclePct);
-            f.printf("  \"rebroadcastMode\": %u,\n", (unsigned)cfg.rebroadcastMode);
-            f.printf("  \"buzzerMode\": %u,\n", (unsigned)cfg.buzzerMode);
-            f.printf("  \"pkiEnabled\": %s,\n", cfg.pkiEnabled ? "true" : "false");
-            f.printf("  \"gpsEnabled\": %s,\n", cfg.gpsEnabled ? "true" : "false");
-            f.printf("  \"timezoneOffset\": %d,\n", (int)cfg.timezoneOffset);
+            char jsonLong[48], jsonShort[16], jsonChName[24];
+            sanitizeJsonString(cfg.longName, jsonLong, sizeof(jsonLong));
+            sanitizeJsonString(cfg.shortName, jsonShort, sizeof(jsonShort));
+            sanitizeJsonString(cfg.primaryChannelName, jsonChName, sizeof(jsonChName));
+            size_t expected = 0;
+            bool jsonOk = true;
+            auto jput = [&](size_t n) {
+                expected += n;
+                if (n == 0) jsonOk = false;
+            };
+            jput(f.printf("{\n"));
+            jput(f.printf("  \"longName\": \"%s\",\n", jsonLong));
+            jput(f.printf("  \"shortName\": \"%s\",\n", jsonShort));
+            jput(f.printf("  \"frequency\": %.3f,\n", cfg.frequency));
+            jput(f.printf("  \"txPower\": %d,\n", cfg.txPower));
+            jput(f.printf("  \"modemPreset\": %u,\n", cfg.modemPreset));
+            jput(f.printf("  \"hopLimit\": %u,\n", cfg.hopLimit));
+            jput(f.printf("  \"frontlight\": %u,\n", cfg.frontlight));
+            jput(f.printf("  \"powerBtnAction\": %u,\n", cfg.powerBtnAction));
+            jput(f.printf("  \"antiGhostThreshold\": %u,\n", cfg.antiGhostThreshold));
+            jput(f.printf("  \"clockLandscape\": %s,\n", cfg.clockLandscape ? "true" : "false"));
+            jput(f.printf("  \"clockFlip180\": %s,\n", cfg.clockFlip180 ? "true" : "false"));
+            jput(f.printf("  \"nodeRole\": %u,\n", cfg.nodeRole));
+            jput(f.printf("  \"nodeInfoIntervalSec\": %u,\n", (unsigned)cfg.nodeInfoIntervalSec));
+            jput(f.printf("  \"telemetryIntervalSec\": %u,\n", (unsigned)cfg.telemetryIntervalSec));
+            jput(f.printf("  \"positionIntervalSec\": %u,\n", (unsigned)cfg.positionIntervalSec));
+            jput(f.printf("  \"neighborInfoIntervalSec\": %u,\n", (unsigned)cfg.neighborInfoIntervalSec));
+            jput(f.printf("  \"dutyCyclePct\": %u,\n", (unsigned)cfg.dutyCyclePct));
+            jput(f.printf("  \"rebroadcastMode\": %u,\n", (unsigned)cfg.rebroadcastMode));
+            jput(f.printf("  \"buzzerMode\": %u,\n", (unsigned)cfg.buzzerMode));
+            jput(f.printf("  \"pkiEnabled\": %s,\n", cfg.pkiEnabled ? "true" : "false"));
+            jput(f.printf("  \"gpsEnabled\": %s,\n", cfg.gpsEnabled ? "true" : "false"));
+            jput(f.printf("  \"timezoneOffset\": %d,\n", (int)cfg.timezoneOffset));
             // Channel identity too, so a recovery from this file restores the full configuration
-            f.printf("  \"primaryChannelName\": \"%s\",\n", cfg.primaryChannelName);
+            jput(f.printf("  \"primaryChannelName\": \"%s\",\n", jsonChName));
             char pskHex[65] = {0};
             for (uint8_t i = 0; i < cfg.primaryPskLen && i < 32; ++i) {
                 snprintf(pskHex + (i * 2), 3, "%02x", cfg.primaryPsk[i]);
             }
-            f.printf("  \"primaryPskHex\": \"%s\"\n", pskHex);
-            f.printf("}\n");
+            jput(f.printf("  \"primaryPskHex\": \"%s\"\n", pskHex));
+            jput(f.printf("}\n"));
+            f.flush(); // see saveAlarmsFile(): the FAT entry is stale until the buffer is synced
+            const size_t actual = f.size();
             f.close();
-            SD_MMC.remove("/monomesh/config.json");
-            if (SD_MMC.rename("/monomesh/config.json.tmp", "/monomesh/config.json")) {
-                ESP_LOGI(TAG, "Saved settings to /sdcard/monomesh/config.json");
+            sodium_memzero(pskHex, sizeof(pskHex));   // hex of the channel key: wipe the temp copy
+            if (!jsonOk || actual < expected) {
+                ESP_LOGE(TAG, "config.json write incomplete (%u/%u B): keeping the previous file",
+                         (unsigned)actual, (unsigned)expected);
+                SD_MMC.remove("/monomesh/config.json.tmp");
             } else {
-                ESP_LOGE(TAG, "config.json swap failed: recovery file kept in /monomesh/config.json.tmp");
+                SD_MMC.remove("/monomesh/config.json");
+                if (SD_MMC.rename("/monomesh/config.json.tmp", "/monomesh/config.json")) {
+                    ESP_LOGI(TAG, "Saved settings to /sdcard/monomesh/config.json");
+                } else {
+                    ESP_LOGE(TAG, "config.json swap failed: recovery file kept in /monomesh/config.json.tmp");
+                }
             }
         }
     }
@@ -757,6 +1006,12 @@ bool StorageManager::loadMapView(int32_t& latE7, int32_t& lonE7, uint8_t& zoom) 
     latE7 = _pref.getInt("mapLatI", 0);
     lonE7 = _pref.getInt("mapLonI", 0);
     zoom = _pref.getUChar("mapZoom", 13);
+    // Corrupt NVS: reject a position outside the valid range and bound the zoom, so the map cannot be
+    // asked for a tile level/path built from a nonsense value.
+    if (latE7 < -900000000 || latE7 > 900000000 || lonE7 < -1800000000 || lonE7 > 1800000000) {
+        return false;
+    }
+    if (zoom > 22) zoom = 22;
     return true;
 }
 
@@ -774,9 +1029,15 @@ bool StorageManager::saveNavHistory(const int* order, int count) {
     for (int i = 0; i < count && len < (int)sizeof(line) - 16; ++i) {
         len += snprintf(line + len, sizeof(line) - len, (i == 0) ? "%d" : ",%d", order[i]);
     }
-    f.printf("%s\n", line);
+    char out[68];
+    const int n = snprintf(out, sizeof(out), "%s\n", line);
+    if (n <= 0 || (size_t)n >= sizeof(out)) {
+        f.close();
+        return false;
+    }
+    const size_t w = f.write(reinterpret_cast<const uint8_t*>(out), (size_t)n);
     f.close();
-    return true;
+    return w == (size_t)n;
 }
 
 bool StorageManager::loadNavHistory(int* order, int count) {
@@ -784,8 +1045,15 @@ bool StorageManager::loadNavHistory(int* order, int count) {
     if (!SD_MMC.exists("/monomesh/nav.txt")) return false;
     File f = SD_MMC.open("/monomesh/nav.txt", FILE_READ);
     if (!f) return false;
-    String line = f.readStringUntil('\n');
+    if (f.size() > 256) {   // 4 small ints: anything bigger is not ours
+        ESP_LOGW(TAG, "nav.txt is unexpectedly large (%u B): ignoring it", (unsigned)f.size());
+        f.close();
+        return false;
+    }
+    String line;
+    const bool lineOk = readLineBounded(f, line, 64);
     f.close();
+    if (!lineOk) return false;
     line.trim();
     if (line.isEmpty()) return false;
 
@@ -931,7 +1199,13 @@ bool StorageManager::saveNodesCsv(const std::vector<NodeRecord>& nodes) {
         return false;
     }
 
-    f.println("nodeNum,idStr,longName,shortName,lat,lon,alt,snr,rssi,lastHeard,battery,voltage,role,pubKey,mac,lastEpoch");
+    size_t expected = 0;
+    bool ok = false;
+    {
+        const size_t w = f.println("nodeNum,idStr,longName,shortName,lat,lon,alt,snr,rssi,lastHeard,battery,voltage,role,pubKey,mac,lastEpoch");
+        expected += w;
+        ok = (w > 0);
+    }
     for (const auto& n : nodes) {
         // Absent fields must not be written as empty: sscanf() with "%64[^,]" stops there and would
         // skip every following column (the MAC and the last-heard epoch used to be lost this way).
@@ -951,13 +1225,33 @@ bool StorageManager::saveNodesCsv(const std::vector<NodeRecord>& nodes) {
         String shortName(n.shortName);
         sanitizeQuotedField(longName);
         sanitizeQuotedField(shortName);
-        f.printf("%u,%s,\"%s\",\"%s\",%.6f,%.6f,%d,%.1f,%.1f,%u,%u,%.2f,%u,%s,%s,%u\n",
-                 (unsigned)n.nodeNum, n.idStr, longName.c_str(), shortName.c_str(),
+        // idStr is unquoted: sanitize it too, or a stray comma from a hand-edited file shifts columns.
+        char idStr[12];
+        strncpy(idStr, n.idStr, sizeof(idStr) - 1);
+        idStr[sizeof(idStr) - 1] = '\0';
+        sanitizeCsvToken(idStr);
+        const size_t w = f.printf("%u,%s,\"%s\",\"%s\",%.6f,%.6f,%d,%.1f,%.1f,%u,%u,%.2f,%u,%s,%s,%u\n",
+                 (unsigned)n.nodeNum, idStr, longName.c_str(), shortName.c_str(),
                  n.lat, n.lon, (int)n.alt, n.snr, n.rssi, (unsigned)n.lastHeard,
                  (unsigned)n.battery, n.voltage, (unsigned)n.role, hexKey, hexMac,
                  (unsigned)n.lastHeardEpoch);
+        expected += w;
+        if (w == 0) {
+            ok = false;
+            break;
+        }
     }
+    f.flush(); // see saveAlarmsFile(): the FAT entry is stale until the buffer is synced
+    const size_t actual = f.size();
     f.close();
+    if (!ok || actual < expected) {
+        // Never swap a truncated file over the (still complete) previous one: the NVS mirror and the
+        // old CSV stay authoritative.
+        ESP_LOGE(TAG, "nodes.csv write incomplete (%u/%u B, card full?): keeping the previous database",
+                 (unsigned)actual, (unsigned)expected);
+        SD_MMC.remove("/monomesh/nodes.csv.tmp");
+        return false;
+    }
     SD_MMC.remove("/monomesh/nodes.csv");
     if (!SD_MMC.rename("/monomesh/nodes.csv.tmp", "/monomesh/nodes.csv")) {
         ESP_LOGE(TAG, "nodes.csv swap failed: database kept in /monomesh/nodes.csv.tmp");
@@ -979,11 +1273,20 @@ bool StorageManager::loadNodesCsv(std::vector<NodeRecord>& nodes) {
 
     File f = SD_MMC.open("/monomesh/nodes.csv", FILE_READ);
     if (!f) return false;
+    if (f.size() > MAX_NODES_CSV_BYTES) {
+        ESP_LOGW(TAG, "nodes.csv is unexpectedly large (%u B): ignoring it", (unsigned)f.size());
+        f.close();
+        return false;
+    }
 
     nodes.clear();
-    String header = f.readStringUntil('\n'); // skip header
+    String line;
+    readLineBounded(f, line, 512); // skip header (bounded too: the cap is above any valid row)
     while (f.available()) {
-        String line = f.readStringUntil('\n');
+        if (!readLineBounded(f, line, 512)) {
+            ESP_LOGW(TAG, "Skipping over-long nodes.csv row");
+            continue;
+        }
         line.trim();
         if (line.length() == 0) continue;
 
@@ -1012,24 +1315,25 @@ bool StorageManager::loadNodesCsv(std::vector<NodeRecord>& nodes) {
                          &nr.lat, &nr.lon, &nr.alt, &nr.snr, &nr.rssi, &nr.lastHeard,
                          &bat, &volt, &role, hexKey, hexMac, &lastEpoch);
         if (matched >= 6) {
-            if (matched >= 7) nr.battery = (uint8_t)bat;
-            if (matched >= 8) nr.voltage = volt;
-            if (matched >= 9) nr.role = (uint8_t)role;
-            if (matched >= 10 && strlen(hexKey) == 64) {
-                for (int b = 0; b < 32; ++b) {
-                    unsigned int byteVal = 0;
-                    sscanf(hexKey + (b * 2), "%02x", &byteVal);
-                    nr.publicKey[b] = (uint8_t)byteVal;
-                }
-                nr.hasPublicKey = true;
+            // The row comes from a user-writable file: validate every field the UI/map will trust.
+            if (!(nr.lat >= -90.0 && nr.lat <= 90.0) || !(nr.lon >= -180.0 && nr.lon <= 180.0)) {
+                nr.lat = 0.0;
+                nr.lon = 0.0;
             }
-            if (matched >= 11 && strlen(hexMac) == 12) {
-                for (int b = 0; b < 6; ++b) {
-                    unsigned int byteVal = 0;
-                    sscanf(hexMac + (b * 2), "%02x", &byteVal);
-                    nr.mac[b] = (uint8_t)byteVal;
-                }
+            if (isnan(nr.snr)) nr.snr = 0.0f;
+            if (isnan(nr.rssi)) nr.rssi = 0.0f;
+            if (matched >= 7) nr.battery = (bat > 100) ? 100 : (uint8_t)bat;
+            if (matched >= 8 && !isnan(volt)) nr.voltage = volt;
+            if (matched >= 9) nr.role = (role <= 2) ? (uint8_t)role : 0;
+            if (matched >= 10 && hexToBytes(hexKey, 32, nr.publicKey)) {
+                nr.hasPublicKey = true;
+            } else {
+                memset(nr.publicKey, 0, sizeof(nr.publicKey));
+            }
+            if (matched >= 11 && hexToBytes(hexMac, 6, nr.mac)) {
                 nr.hasMac = true;
+            } else {
+                memset(nr.mac, 0, sizeof(nr.mac));
             }
             if (matched >= 12 && lastEpoch > 1700000000UL) {
                 nr.lastHeardEpoch = lastEpoch;
@@ -1056,6 +1360,9 @@ bool StorageManager::loadNodesCsv(std::vector<NodeRecord>& nodes) {
 // 24 KB NVS partition shared with settings, keys and the message ring never fills up.
 static constexpr uint8_t NVS_NODE_PER_CHUNK = 8;
 static constexpr uint8_t NVS_NODE_MAX = 16;
+// Slots ever written by any firmware build (2 today, 5 in the old 40-node mirror): cleanup only
+// touches ndB_* keys and stops stale blobs from wasting the 24 KB NVS partition forever.
+static constexpr uint8_t NVS_NODE_CHUNK_SLOTS = 8;
 
 bool StorageManager::saveNodesNvs(const std::vector<NodeRecord>& nodes) {
     // Refuse to write when the partition is tight: a failed write would corrupt nothing but would
@@ -1069,8 +1376,12 @@ bool StorageManager::saveNodesNvs(const std::vector<NodeRecord>& nodes) {
 
     uint8_t count = (uint8_t)(nodes.size() > NVS_NODE_MAX ? NVS_NODE_MAX : nodes.size());
     // Invalidate the mirror before overwriting the chunks: if a write fails (NVS full) the next boot
-    // must not rebuild a mixed/truncated list from the old count and the new chunks.
-    _pref.putUChar("ndCnt", 0);
+    // must not rebuild a mixed/truncated list from the old count and the new chunks. If even the
+    // invalidation fails, abort before touching the chunks.
+    if (_pref.putUChar("ndCnt", 0) != 1) {
+        ESP_LOGE(TAG, "NVS node mirror invalidation failed: leaving the previous mirror untouched");
+        return false;
+    }
 
     NvsNodeRecord buf[NVS_NODE_PER_CHUNK];
     for (uint8_t i = 0; i < count; i += NVS_NODE_PER_CHUNK) {
@@ -1098,9 +1409,9 @@ bool StorageManager::saveNodesNvs(const std::vector<NodeRecord>& nodes) {
             return false;
         }
     }
-    // Drop chunks left over from a previously longer list
+    // Drop chunks left over from a previously longer list (including the old 40-node mirror layout)
     for (uint8_t c = (uint8_t)((count + NVS_NODE_PER_CHUNK - 1) / NVS_NODE_PER_CHUNK);
-         c < (NVS_NODE_MAX / NVS_NODE_PER_CHUNK); ++c) {
+         c < NVS_NODE_CHUNK_SLOTS; ++c) {
         char key[10];
         snprintf(key, sizeof(key), "ndB_%u", (unsigned)c);
         _pref.remove(key);
@@ -1125,9 +1436,12 @@ bool StorageManager::loadNodesNvs(std::vector<NodeRecord>& nodes) {
         snprintf(key, sizeof(key), "ndB_%u", (unsigned)(i / NVS_NODE_PER_CHUNK));
         uint8_t n = (uint8_t)((count - i) > NVS_NODE_PER_CHUNK ? NVS_NODE_PER_CHUNK : (count - i));
         size_t want = (size_t)n * sizeof(NvsNodeRecord);
+        if (!_pref.isKey(key)) break;   // hole in the mirror: keep what was read so far, no error log
         memset(buf, 0, sizeof(buf));
         if (_pref.getBytes(key, buf, want) != want) break;
         for (uint8_t k = 0; k < n; ++k) {
+            // Reject entries a corrupt blob could carry: 0/0xFFFFFFFF are not real node numbers.
+            if (buf[k].nodeNum == 0 || buf[k].nodeNum == 0xFFFFFFFFu) continue;
             NodeRecord rec = {};
             rec.nodeNum = buf[k].nodeNum;
             strncpy(rec.longName, buf[k].longName, sizeof(rec.longName) - 1);
@@ -1151,13 +1465,14 @@ bool StorageManager::clearNodes() {
         ESP_LOGI(TAG, "Removed /sdcard/monomesh/nodes.csv");
     }
     // Clear the NVS mirror too, otherwise the deleted list would come back when no card is present
-    _pref.putUChar("ndCnt", 0);
-    for (uint8_t c = 0; c < (NVS_NODE_MAX / NVS_NODE_PER_CHUNK); ++c) {
+    bool ok = (_pref.putUChar("ndCnt", 0) == 1);
+    if (!ok) ESP_LOGE(TAG, "NVS node mirror invalidation failed (NVS full?)");
+    for (uint8_t c = 0; c < NVS_NODE_CHUNK_SLOTS; ++c) {
         char key[10];
         snprintf(key, sizeof(key), "ndB_%u", (unsigned)c);
         _pref.remove(key);
     }
-    return true;
+    return ok;
 }
 
 bool StorageManager::writeMessageToCsv(const SavedMessage& msg) {
@@ -1182,8 +1497,22 @@ bool StorageManager::writeMessageToCsv(const SavedMessage& msg) {
     strncpy(cleanSender, msg.senderShort, sizeof(cleanSender) - 1);
     cleanSender[sizeof(cleanSender) - 1] = '\0';
     sanitizeCsvToken(cleanSender);
+    // Bounded copies too: a corrupt NVS blob can leave these arrays without a terminator.
+    char cleanTime[sizeof(msg.timeStr)];
+    strncpy(cleanTime, msg.timeStr, sizeof(cleanTime) - 1);
+    cleanTime[sizeof(cleanTime) - 1] = '\0';
+    if (cleanTime[0] == '\0') strncpy(cleanTime, "--:--", sizeof(cleanTime) - 1);
+    sanitizeCsvToken(cleanTime);
+    char cleanPreset[sizeof(msg.channelPreset)];
+    strncpy(cleanPreset, msg.channelPreset, sizeof(cleanPreset) - 1);
+    cleanPreset[sizeof(cleanPreset) - 1] = '\0';
+    if (cleanPreset[0] == '\0') strncpy(cleanPreset, "MedFast", sizeof(cleanPreset) - 1);
+    sanitizeCsvToken(cleanPreset);
 
-    f.printf("%u,%u,%u,%s,%d,%u,%d,%s,%s,%s\n",
+    // Format the row first and compare the written bytes with its length: Print::printf() returns
+    // the bytes actually written, so a disk-full partial write would otherwise look successful.
+    char row[384];
+    const int n = snprintf(row, sizeof(row), "%u,%u,%u,%s,%d,%u,%d,%s,%s,%s\n",
              (unsigned)msg.id,
              (unsigned)msg.fromNode,
              (unsigned)msg.toNode,
@@ -1191,30 +1520,56 @@ bool StorageManager::writeMessageToCsv(const SavedMessage& msg) {
              msg.isOutgoing ? 1 : 0,
              (unsigned)msg.timestamp,
              msg.isAcked ? 1 : 0,
-             msg.timeStr[0] ? msg.timeStr : "--:--",
-             msg.channelPreset[0] ? msg.channelPreset : "MedFast",
+             cleanTime,
+             cleanPreset,
              cleanText);
+    if (n <= 0 || (size_t)n >= sizeof(row)) {
+        ESP_LOGW(TAG, "messages.csv row does not fit the staging buffer");
+        f.close();
+        return false;
+    }
+    const size_t w = f.write(reinterpret_cast<const uint8_t*>(row), (size_t)n);
     f.close();
+    if (w != (size_t)n) {
+        ESP_LOGW(TAG, "messages.csv append failed (%u/%d B, card full?): row not persisted",
+                 (unsigned)w, n);
+        return false;
+    }
     return true;
 }
 
 bool StorageManager::appendChatMessage(const SavedMessage& msg) {
     // 1. Persist to SD card if mounted (otherwise the ring below is the only copy)
-    writeMessageToCsv(msg);
+    const bool onSd = writeMessageToCsv(msg);
 
     // 2. Mirror into NVS ring buffer (up to 24 most recent messages). Only advance the ring when the
     // blob was actually stored: counting failed writes made m_cnt point at keys that never existed.
     uint32_t head = _pref.getUInt("m_head", 0);
     uint32_t cnt = _pref.getUInt("m_cnt", 0);
+    // Never store a blob with unterminated char arrays: every later %s on it would read past the
+    // record (a corrupt/foreign NVS entry would otherwise poison the whole ring).
+    SavedMessage safe = msg;
+    safe.text[sizeof(safe.text) - 1] = '\0';
+    safe.senderShort[sizeof(safe.senderShort) - 1] = '\0';
+    safe.timeStr[sizeof(safe.timeStr) - 1] = '\0';
+    safe.channelPreset[sizeof(safe.channelPreset) - 1] = '\0';
     char key[16];
     snprintf(key, sizeof(key), "msg_%u", (unsigned)(head % 24));
-    if (_pref.putBytes(key, &msg, sizeof(SavedMessage)) != sizeof(SavedMessage)) {
+    if (_pref.putBytes(key, &safe, sizeof(SavedMessage)) != sizeof(SavedMessage)) {
         ESP_LOGE(TAG, "NVS message ring write failed (key %s): NVS full?", key);
-        return _sdMounted; // on SD the message is safe, without SD it only lives in RAM
+        return onSd; // on SD the message is safe, without SD it only lives in RAM
     }
-    _pref.putUInt("m_head", (head + 1) % 24);
+    // The blob just written stays invisible until head/count advance; if a counter write fails the
+    // slot is simply rewritten by the next append, so the ring never gets a hole.
+    if (_pref.putUInt("m_head", (head + 1) % 24) != 4) {
+        ESP_LOGE(TAG, "NVS message ring head update failed: newest message not counted");
+        return onSd;
+    }
     if (cnt < 24) {
-        _pref.putUInt("m_cnt", cnt + 1);
+        if (_pref.putUInt("m_cnt", cnt + 1) != 4) {
+            ESP_LOGE(TAG, "NVS message ring count update failed: newest message not counted");
+            return onSd;
+        }
     }
 
     return true;
@@ -1232,8 +1587,14 @@ void StorageManager::readNvsMessages(std::vector<SavedMessage>& messages) {
         const uint32_t idx = (start + i) % 24;
         char key[16];
         snprintf(key, sizeof(key), "msg_%u", (unsigned)idx);
+        if (!_pref.isKey(key)) continue;   // hole left by an older build/partial write, no error log
         SavedMessage sm = {};
         if (_pref.getBytes(key, &sm, sizeof(SavedMessage)) == sizeof(SavedMessage)) {
+            // Force NUL terminators: these blobs cross firmware versions and every consumer uses %s.
+            sm.text[sizeof(sm.text) - 1] = '\0';
+            sm.senderShort[sizeof(sm.senderShort) - 1] = '\0';
+            sm.timeStr[sizeof(sm.timeStr) - 1] = '\0';
+            sm.channelPreset[sizeof(sm.channelPreset) - 1] = '\0';
             if (sm.timeStr[0] == '\0') strncpy(sm.timeStr, "--:--", sizeof(sm.timeStr) - 1);
             messages.push_back(sm);
         }
@@ -1260,10 +1621,12 @@ bool StorageManager::flushNvsMessagesToSd() {
             if (f.size() > tailSpan) {
                 f.seek(f.size() - tailSpan);
                 // drop the (possibly partial) first line of the window
-                f.readStringUntil('\n');
+                String drop;
+                readLineBounded(f, drop, 512);
             }
+            String line;
             while (f.available()) {
-                String line = f.readStringUntil('\n');
+                if (!readLineBounded(f, line, 512)) continue;   // skip a corrupt/over-long row
                 uint32_t lineId = 0;
                 if (sscanf(line.c_str(), "%u,", &lineId) == 1) knownIds.push_back(lineId);
             }
@@ -1297,63 +1660,100 @@ bool StorageManager::updateChatMessageAck(uint32_t id) {
     if (_sdMounted && SD_MMC.exists("/monomesh/messages.csv")) {
         File fIn = SD_MMC.open("/monomesh/messages.csv", FILE_READ);
         if (fIn) {
-            File fOut = SD_MMC.open("/monomesh/messages.tmp", FILE_WRITE);
-            if (fOut) {
-                while (fIn.available()) {
-                    String line = fIn.readStringUntil('\n');
-                    String trimmed = line;
-                    trimmed.trim();
-                    if (trimmed.length() == 0) continue;
-
-                    if (trimmed.startsWith("id,")) {
-                        fOut.println(line);
-                        continue;
-                    }
-
-                    // Check if line matches packet ID
-                    uint32_t lineId = 0;
-                    if (sscanf(trimmed.c_str(), "%u,", &lineId) == 1 && lineId == id) {
-                        // Match found! Re-parse and rewrite with isAck = 1 (always in the 10-column layout)
-                        SavedMessage sm = {};
-                        if (parseMessageCsvLine(trimmed, sm)) {
-                            char cleanText[sizeof(sm.text)];
-                            strncpy(cleanText, sm.text, sizeof(cleanText) - 1);
-                            cleanText[sizeof(cleanText) - 1] = '\0';
-                            for (char* p = cleanText; *p; ++p) {
-                                if (*p == '\n' || *p == '\r') *p = ' ';
-                            }
-                            char cleanSender[sizeof(sm.senderShort)];
-                            strncpy(cleanSender, sm.senderShort, sizeof(cleanSender) - 1);
-                            cleanSender[sizeof(cleanSender) - 1] = '\0';
-                            sanitizeCsvToken(cleanSender);
-                            fOut.printf("%u,%u,%u,%s,%d,%u,1,%s,%s,%s\n",
-                                        (unsigned)sm.id, (unsigned)sm.fromNode, (unsigned)sm.toNode,
-                                        cleanSender, sm.isOutgoing ? 1 : 0, (unsigned)sm.timestamp,
-                                        sm.timeStr[0] ? sm.timeStr : "--:--",
-                                        sm.channelPreset[0] ? sm.channelPreset : "MedFast", cleanText);
-                        } else {
-                            fOut.println(trimmed);
-                        }
-                        updated = true;
-                    } else {
-                        fOut.println(trimmed);
-                    }
-                }
-                fOut.close();
-            }
-            fIn.close();
-
-            if (updated) {
-                SD_MMC.remove("/monomesh/messages.csv");
-                if (SD_MMC.rename("/monomesh/messages.tmp", "/monomesh/messages.csv")) {
-                    ESP_LOGI(TAG, "Persisted ACK for packet 0x%08x in /sdcard/monomesh/messages.csv", (unsigned)id);
-                } else {
-                    // The old CSV is already gone but the updated copy is intact: keep it under a
-                    // name the boot path recovers (loadChatMessages) instead of losing the history.
-                    ESP_LOGE(TAG, "messages.csv swap failed: history kept in /monomesh/messages.tmp");
-                }
+            if (fIn.size() > MAX_CHAT_REWRITE_BYTES) {
+                // A corrupt/huge history must not stall the ACK path: the NVS ring below still gets
+                // the flag and the file is left untouched.
+                ESP_LOGW(TAG, "messages.csv too large (%u B): skipping the ACK rewrite on SD",
+                         (unsigned)fIn.size());
+                fIn.close();
             } else {
-                SD_MMC.remove("/monomesh/messages.tmp");
+                File fOut = SD_MMC.open("/monomesh/messages.tmp", FILE_WRITE);
+                if (fOut) {
+                    size_t expected = 0;
+                    bool writeOk = true;
+                    auto mput = [&](size_t n) {
+                        expected += n;
+                        if (n == 0) writeOk = false;
+                    };
+                    String line;
+                    while (fIn.available()) {
+                        if (!readLineBounded(fIn, line, 512)) {
+                            // Over-long/corrupt row: rewriting what we understood would silently drop
+                            // history, so abort and keep the original file.
+                            ESP_LOGW(TAG, "messages.csv has an over-long row: skipping the ACK rewrite");
+                            writeOk = false;
+                            break;
+                        }
+                        String trimmed = line;
+                        trimmed.trim();
+                        if (trimmed.length() == 0) continue;
+
+                        if (trimmed.startsWith("id,")) {
+                            mput(fOut.println(line));
+                            continue;
+                        }
+
+                        // Check if line matches packet ID
+                        uint32_t lineId = 0;
+                        if (sscanf(trimmed.c_str(), "%u,", &lineId) == 1 && lineId == id) {
+                            // Match found! Re-parse and rewrite with isAck = 1 (always in the 10-column layout)
+                            SavedMessage sm = {};
+                            if (parseMessageCsvLine(trimmed, sm)) {
+                                char cleanText[sizeof(sm.text)];
+                                strncpy(cleanText, sm.text, sizeof(cleanText) - 1);
+                                cleanText[sizeof(cleanText) - 1] = '\0';
+                                for (char* p = cleanText; *p; ++p) {
+                                    if (*p == '\n' || *p == '\r') *p = ' ';
+                                }
+                                char cleanSender[sizeof(sm.senderShort)];
+                                strncpy(cleanSender, sm.senderShort, sizeof(cleanSender) - 1);
+                                cleanSender[sizeof(cleanSender) - 1] = '\0';
+                                sanitizeCsvToken(cleanSender);
+                                char cleanTime[sizeof(sm.timeStr)];
+                                strncpy(cleanTime, sm.timeStr, sizeof(cleanTime) - 1);
+                                cleanTime[sizeof(cleanTime) - 1] = '\0';
+                                if (cleanTime[0] == '\0') strncpy(cleanTime, "--:--", sizeof(cleanTime) - 1);
+                                char cleanPreset[sizeof(sm.channelPreset)];
+                                strncpy(cleanPreset, sm.channelPreset, sizeof(cleanPreset) - 1);
+                                cleanPreset[sizeof(cleanPreset) - 1] = '\0';
+                                if (cleanPreset[0] == '\0') strncpy(cleanPreset, "MedFast", sizeof(cleanPreset) - 1);
+                                mput(fOut.printf("%u,%u,%u,%s,%d,%u,1,%s,%s,%s\n",
+                                            (unsigned)sm.id, (unsigned)sm.fromNode, (unsigned)sm.toNode,
+                                            cleanSender, sm.isOutgoing ? 1 : 0, (unsigned)sm.timestamp,
+                                            cleanTime, cleanPreset, cleanText));
+                            } else {
+                                mput(fOut.println(trimmed));
+                            }
+                            updated = true;
+                        } else {
+                            mput(fOut.println(trimmed));
+                        }
+                    }
+                    fOut.flush(); // see saveAlarmsFile(): the FAT entry is stale until the buffer is synced
+                    const size_t actual = fOut.size();
+                    fOut.close();
+                    if (!writeOk || actual < expected) {
+                        // Never swap a truncated file over the only copy of the history.
+                        ESP_LOGE(TAG, "messages.csv rewrite incomplete (%u/%u B, card full?): keeping the original",
+                                 (unsigned)actual, (unsigned)expected);
+                        SD_MMC.remove("/monomesh/messages.tmp");
+                        updated = false;
+                    }
+                }
+                fIn.close();
+
+                if (updated) {
+                    SD_MMC.remove("/monomesh/messages.csv");
+                    if (SD_MMC.rename("/monomesh/messages.tmp", "/monomesh/messages.csv")) {
+                        ESP_LOGI(TAG, "Persisted ACK for packet 0x%08x in /sdcard/monomesh/messages.csv", (unsigned)id);
+                    } else {
+                        // The old CSV is already gone but the updated copy is intact: keep it under a
+                        // name the boot path recovers (loadChatMessages) instead of losing the history.
+                        ESP_LOGE(TAG, "messages.csv swap failed: history kept in /monomesh/messages.tmp");
+                    }
+                } else {
+                    SD_MMC.remove("/monomesh/messages.tmp");
+                }
             }
         }
     }
@@ -1393,14 +1793,28 @@ bool StorageManager::loadChatMessages(std::vector<SavedMessage>& messages) {
     if (_sdMounted && SD_MMC.exists("/monomesh/messages.csv")) {
         File f = SD_MMC.open("/monomesh/messages.csv", FILE_READ);
         if (f) {
-            String header = f.readStringUntil('\n'); // skip header
+            // The history grows forever while live chat keeps only the newest MAX_MESSAGES per queue:
+            // read just the newest bounded window and cap the restored vector, so a huge/corrupt file
+            // cannot exhaust the heap at boot.
+            const size_t total = f.size();
+            if (total > MAX_CHAT_SCAN_BYTES) {
+                f.seek(total - MAX_CHAT_SCAN_BYTES);
+                String drop;
+                readLineBounded(f, drop, 512);   // drop the partial first line of the window
+            } else {
+                String header;
+                readLineBounded(f, header, 512); // skip header
+            }
+            String line;
             while (f.available()) {
-                String line = f.readStringUntil('\n');
+                if (!readLineBounded(f, line, 512)) continue;   // skip a corrupt/over-long row
                 line.trim();
                 if (line.length() == 0) continue;
 
                 SavedMessage sm = {};
                 if (parseMessageCsvLine(line, sm)) {
+                    // At the cap, drop the oldest so the newest messages always survive.
+                    if (messages.size() >= MAX_RESTORED_CHAT_MESSAGES) messages.erase(messages.begin());
                     messages.push_back(sm);
                 } else {
                     ESP_LOGW(TAG, "Skipping unreadable messages.csv row (id parse failed)");

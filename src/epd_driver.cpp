@@ -5,6 +5,38 @@ static constexpr const char* TAG = "MonoMesh-EPD";
 
 namespace MonoMesh {
 
+// Map the driver mode to the M5GFX LUT. Keeping the mapping in one place lets the flush paths
+// re-assert the driver mode on the display instead of trusting M5.Display.getEpdMode(), which is
+// stale after the direct setEpdMode(epd_quality) calls of ClockMode/BSP shutdown screens.
+static m5gfx::epd_mode_t gfxModeFor(RefreshMode mode) {
+    switch (mode) {
+        case RefreshMode::FastPartial: return m5gfx::epd_mode_t::epd_fastest;
+        case RefreshMode::Grayscale:   return m5gfx::epd_mode_t::epd_text;
+        case RefreshMode::FullClear:   return m5gfx::epd_mode_t::epd_quality;
+    }
+    return m5gfx::epd_mode_t::epd_text;
+}
+
+// Intersect a rectangle with the panel without ever computing x+w in 32-bit: both values come from
+// a public API, so a caller (or a future one) can pass extremes that would overflow the addition.
+static bool clipToPanel(int32_t& x, int32_t& y, int32_t& w, int32_t& h) {
+    const int64_t screenW = (int64_t)M5.Display.width();
+    const int64_t screenH = (int64_t)M5.Display.height();
+    int64_t x0 = x, y0 = y;
+    int64_t x1 = (int64_t)x + (int64_t)w;
+    int64_t y1 = (int64_t)y + (int64_t)h;
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 > screenW) x1 = screenW;
+    if (y1 > screenH) y1 = screenH;
+    if (x0 >= x1 || y0 >= y1) return false;
+    x = (int32_t)x0;
+    y = (int32_t)y0;
+    w = (int32_t)(x1 - x0);
+    h = (int32_t)(y1 - y0);
+    return true;
+}
+
 bool EPDDriver::init() {
     ESP_LOGI(TAG, "Initializing SSD1677 Display Controller...");
     M5.Display.setRotation(0);
@@ -31,17 +63,7 @@ void EPDDriver::applyEpdMode(m5gfx::epd_mode_t mode) {
 
 void EPDDriver::setRefreshMode(RefreshMode mode) {
     _currentMode = mode;
-    switch (mode) {
-        case RefreshMode::FastPartial:
-            applyEpdMode(m5gfx::epd_mode_t::epd_fastest);
-            break;
-        case RefreshMode::Grayscale:
-            applyEpdMode(m5gfx::epd_mode_t::epd_text);
-            break;
-        case RefreshMode::FullClear:
-            applyEpdMode(m5gfx::epd_mode_t::epd_quality);
-            break;
-    }
+    applyEpdMode(gfxModeFor(mode));
 }
 
 void EPDDriver::flush() {
@@ -55,16 +77,14 @@ void EPDDriver::flush() {
         _partialRefreshCount = 0;
     }
 
+    // The driver mode is authoritative: a direct setEpdMode() elsewhere must not make this full
+    // update use the wrong waveform.
+    M5.Display.setEpdMode(gfxModeFor(_currentMode));
     M5.Display.display();
 }
 
 void EPDDriver::flushRect(int32_t x, int32_t y, int32_t w, int32_t h, bool countPartial) {
-    // Clip bounding box to screen dimensions
-    if (x < 0) { w += x; x = 0; }
-    if (y < 0) { h += y; y = 0; }
-    if (x + w > M5.Display.width())  w = M5.Display.width() - x;
-    if (y + h > M5.Display.height()) h = M5.Display.height() - y;
-    if (w <= 0 || h <= 0) return;
+    if (!clipToPanel(x, y, w, h)) return;
 
     if (_currentMode == RefreshMode::FastPartial) {
         if (countPartial) {
@@ -85,29 +105,22 @@ void EPDDriver::flushRect(int32_t x, int32_t y, int32_t w, int32_t h, bool count
     }
 
     // Always enforce 1-bit fast LUT for rectangular partial updates to prevent screen inversion flash
-    auto prevMode = M5.Display.getEpdMode();
     M5.Display.setEpdMode(m5gfx::epd_mode_t::epd_fastest);
     M5.Display.display(x, y, w, h);
-    M5.Display.setEpdMode(prevMode);
+    M5.Display.setEpdMode(gfxModeFor(_currentMode));
 }
 
 void EPDDriver::flushRectGrayscale(int32_t x, int32_t y, int32_t w, int32_t h) {
-    if (x < 0) { w += x; x = 0; }
-    if (y < 0) { h += y; y = 0; }
-    if (x + w > M5.Display.width())  w = M5.Display.width() - x;
-    if (y + h > M5.Display.height()) h = M5.Display.height() - y;
-    if (w <= 0 || h <= 0) return;
+    if (!clipToPanel(x, y, w, h)) return;
 
-    auto prevMode = M5.Display.getEpdMode();
     M5.Display.setEpdMode(m5gfx::epd_mode_t::epd_text);
     _partialRefreshCount++; // a real 4-level pass does need the periodic anti-ghosting clean-up
     if (_antiGhostThreshold > 0 && _partialRefreshCount >= _antiGhostThreshold) {
-        M5.Display.setEpdMode(prevMode);
-        fullClear();
+        fullClear(); // restores the driver mode itself
         return;
     }
     M5.Display.display(x, y, w, h);
-    M5.Display.setEpdMode(prevMode);
+    M5.Display.setEpdMode(gfxModeFor(_currentMode));
 }
 
 void EPDDriver::fullClear() {

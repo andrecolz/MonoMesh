@@ -427,6 +427,7 @@ private:
     bool _nodeDbDirty = false;
     uint32_t _lastPositionTime = 0;
     uint32_t _lastPositionReplyMillis = 0; // throttle for unicast position replies (official: 3 min)
+    uint32_t _lastTracerouteReplyMillis = 0; // global spacing for traceroute replies
     uint32_t _bootMillis = 0;
     bool _bootNodeInfoSent = false;
     uint32_t _lastNodeInfoTx = 0;
@@ -469,6 +470,20 @@ private:
     };
     static constexpr uint32_t NODEINFO_REQUEST_COOLDOWN_MS = 12UL * 3600UL * 1000UL;
     NodeInfoRequest _nodeInfoRequests[32];
+
+    // Anti-amplification budget for automatic unicast replies (NodeInfo, telemetry, position,
+    // traceroute): an attacker rotating spoofed senders must not be able to turn us into a beacon.
+    // The global throttles stay as a second layer; this one is per sender.
+    struct AutoReplyRate {
+        uint32_t nodeNum = 0;
+        uint32_t windowStart = 0;
+        uint8_t count = 0;
+    };
+    static constexpr size_t AUTO_REPLY_SLOTS = 8;
+    static constexpr uint32_t AUTO_REPLY_WINDOW_MS = 60000;
+    static constexpr uint8_t AUTO_REPLY_MAX_PER_WINDOW = 6;
+    AutoReplyRate _autoReplyRates[AUTO_REPLY_SLOTS] = {};
+    bool allowAutoReply(uint32_t nodeNum);
     TaskHandle_t _radioTask = nullptr;
     QueueHandle_t _rxQueue = nullptr;
     SemaphoreHandle_t _radioMutex = nullptr;
@@ -526,6 +541,7 @@ private:
     void updateAirtimeMetrics();
 
     // Queues
+    static constexpr size_t MAX_PENDING_ACKS = 16; // bounds the DM retry list (~11 KB worst case)
     std::vector<PendingAck> _pendingAcks;
     std::vector<PendingRelay> _pendingRelays;
 

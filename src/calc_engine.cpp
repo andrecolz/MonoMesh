@@ -150,6 +150,29 @@ private:
             fail();
             return 0.0;
         }
+        // A number must carry at least one digit: strtod() would accept a lone "." as 0.0 without
+        // consuming it, so "1+." evaluated to 1 instead of failing.
+        bool hasDigit = false;
+        for (size_t i = start; i < _pos; ++i) {
+            if (_s[i] >= '0' && _s[i] <= '9') {
+                hasDigit = true;
+                break;
+            }
+        }
+        if (!hasDigit) {
+            fail();
+            return 0.0;
+        }
+        // A result outside the 1e-9..1e12 range is shown with %.6e (formatNumber) and re-inserted
+        // into the expression when the user continues with an operator ("operatore continua dal
+        // risultato"): accept the exponent, otherwise every such continuation ended in Error.
+        if (_pos < _s.size() && (_s[_pos] == 'e' || _s[_pos] == 'E')) {
+            size_t expEnd = _pos + 1;
+            if (expEnd < _s.size() && (_s[expEnd] == '+' || _s[expEnd] == '-')) ++expEnd;
+            const size_t expDigits = expEnd;
+            while (expEnd < _s.size() && _s[expEnd] >= '0' && _s[expEnd] <= '9') ++expEnd;
+            if (expEnd > expDigits) _pos = expEnd; // consume only a well-formed exponent
+        }
         const std::string num = _s.substr(start, _pos - start);
         return strtod(num.c_str(), nullptr);
     }

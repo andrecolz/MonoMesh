@@ -233,6 +233,9 @@ private:
     std::vector<AlarmRecord> _alarmsFileCache;
 
     bool initSdCard();
+    // Promotes a complete <name>.tmp left by an interrupted atomic swap (or deletes a truncated one)
+    // before anything reads the final file.
+    void recoverTempFile(const char* tmpPath, const char* finalPath, size_t maxBytes);
 };
 
 } // namespace MonoMesh

@@ -51,6 +51,10 @@ private:
     static constexpr int FAB_PIN_Y = 600;              // "set position here"
     static constexpr int TILE_PX = 256;
     static constexpr int TILE_SLOTS = 24;              // decoded tiles kept in RAM
+    // Web Mercator levels this view shifts safely. A zoom byte read from a container
+    // (or from NVS) outside this range would make "1 << z" undefined in composeScene().
+    static constexpr int ZOOM_MIN = 1;
+    static constexpr int ZOOM_MAX = 19;
     static constexpr uint32_t MISS_RETRY_MS = 5000;    // re-probe a cached miss after this long
     static constexpr uint32_t SETTLE_MS = 1000;        // 1-bit while moving, gray once you stop
     static constexpr uint32_t ZOOM_SETTLE_MS = 1000;   // 1s debounce before 4-level grayscale refresh
@@ -164,6 +168,9 @@ private:
     // Web Mercator helpers (same scheme as /tiles/z/x/y.png)
     static void latLonToTile(double lat, double lon, int z, double& tx, double& ty);
     static void tileToLatLon(double tx, double ty, int z, double& lat, double& lon);
+    // Rejects NaN, ±inf and anything outside the Web Mercator range this view can draw:
+    // node positions arrive from the mesh and a container/NVS can carry anything.
+    static bool validMapCenter(double lat, double lon);
     static bool parseInt(const char* s, int& out);
     static bool parseTileFileName(const char* name, int& out);
 

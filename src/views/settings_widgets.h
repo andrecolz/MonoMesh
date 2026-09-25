@@ -190,7 +190,12 @@ inline void sliderRow(M5GFX& g, const RowRect& r, const char* label, const char*
     const int th = 12;
     g.drawRoundRect(tx, ty, tw, th, 6, TFT_BLACK);
     g.fillRoundRect(tx + 1, ty + 1, tw - 2, th - 2, 5, TFT_WHITE);
-    const int knobX = tx + (int)((float)pos / (steps > 0 ? steps : 1) * (tw - 1));
+    // Defensive clamp: a stored value outside 0..steps (hand-edited config.json) must not push the
+    // knob past the track (the old code drew it off the card).
+    if (steps < 1) steps = 1;
+    if (pos < 0) pos = 0;
+    if (pos > steps) pos = steps;
+    const int knobX = tx + (int)((float)pos / (float)steps * (tw - 1));
     if (knobX > tx + 2) g.fillRect(tx + 2, ty + 2, knobX - tx - 2, th - 4, TFT_BLACK);
     if (ticks && steps > 1) {
         for (int i = 1; i < steps; ++i) {

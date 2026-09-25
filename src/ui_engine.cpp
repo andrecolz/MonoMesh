@@ -262,12 +262,16 @@ void UIEngine::update() {
 
         // 4. Top bar click or swipe down *starting inside the top bar* opens the Quick Menu (works
         // even if the keyboard is open). A swipe that starts lower down belongs to the view: on the
-        // map it used to steal the gesture needed to pan the map.
+        // map it used to steal the gesture needed to pan the map. A slow drag is reported as Up by
+        // TouchManager (anything longer than 600 ms), so it must open the menu too instead of
+        // falling through to the view under the release point.
         if (ev.type == TouchEventType::Click && ev.y >= 0 && ev.y < 44) {
             openQuickMenu();
             return;
         }
-        if (ev.type == TouchEventType::SwipeDown && ev.startY >= 0 && ev.startY < 44) {
+        if (ev.startY >= 0 && ev.startY < 44 &&
+            (ev.type == TouchEventType::SwipeDown ||
+             (ev.type == TouchEventType::Up && (ev.y - ev.startY) >= 60))) {
             openQuickMenu();
             return;
         }
@@ -286,17 +290,23 @@ void UIEngine::update() {
                 return;
             }
         } else {
-            // 6. Bottom Nav Bar handles touch (Y: 730..800) only when keyboard is closed
-            if (!_quickMenuOpen && ev.y >= 730 && ev.y <= 800) {
+            // 6. Bottom Nav Bar handles touch (Y: 730..800) only when keyboard is closed. Routing a
+            // tap by the release point is fine, but an Up that started in the content is the tail of
+            // a drag (e.g. a map pan) and must not select the tab under the finger.
+            if (!_quickMenuOpen && ev.y >= 730 && ev.y <= 800 &&
+                (ev.type == TouchEventType::Click || ev.startY >= 730)) {
                 if (handleNavBarTouch(ev)) {
                     return;
                 }
             }
         }
 
-        // 7. Current active view handles touch
+        // 7. Current active view handles touch. The gesture must have started in the content area:
+        // a drag/tap that began on the status bar or on the nav bar is an overlay gesture, not a
+        // tap on the view (views treat Up as a click), and the overlays have already had their say.
         int viewBottomLimit = _keyboardOpen ? 430 : 730;
-        if (!_quickMenuOpen && ev.y >= 44 && ev.y < viewBottomLimit) {
+        if (!_quickMenuOpen && ev.y >= 44 && ev.y < viewBottomLimit &&
+            ev.startY >= 44 && ev.startY < 730) {
             if (_views[_currentViewIndex]->handleTouch(ev)) {
                 return;
             }
@@ -640,14 +650,21 @@ void UIEngine::drawKeyboard(M5GFX& gfx) {
     std::string shown;
     const int firstIdx = (int)((_keyboardBuffer.size() > maxChars) ? (_keyboardBuffer.size() - maxChars) : 0);
     for (int i = (int)_keyboardBuffer.size() - 1; i >= firstIdx; --i) {
-        std::string candidate = _keyboardBuffer.substr((size_t)i) + "_";
-        if (gfx.textWidth(candidate.c_str()) > maxTextPx && !shown.empty()) break;
+        // Sanitize before measuring so the fitted suffix matches what is actually drawn: the buffer
+        // can start from a channel/name read from NVS or config.json (control bytes, broken UTF-8).
+        // The shared helper keeps '\n' for the chat bubbles, but this field is single-line.
+        std::string raw = _keyboardBuffer.substr((size_t)i) + "_";
+        char candidate[96];
+        sanitizeDisplayText(raw.c_str(), candidate, sizeof(candidate));
+        for (char* q = candidate; *q != '\0'; ++q) {
+            if (*q == '\n') *q = ' ';
+        }
+        if (gfx.textWidth(candidate) > maxTextPx && !shown.empty()) break;
         shown = candidate;
         if (gfx.textWidth(shown.c_str()) > maxTextPx) break;
     }
     if (shown.empty()) shown = "_";
-    std::string preview = shown;
-    gfx.drawString(preview.c_str(), 16, 457);
+    gfx.drawString(shown.c_str(), 16, 457);
 
     int kw = 42;
     int kh = 54;
@@ -744,6 +761,9 @@ void UIEngine::drawKeyboard(M5GFX& gfx) {
     // Space
     gfx.drawRoundRect(120, 728, 236, r4H, 5, TFT_BLACK);
     gfx.fillRoundRect(121, 729, 234, r4H - 2, 4, TFT_WHITE);
+    // The label was inheriting the LIGHTGRAY background of the backspace key: M5GFX fills each glyph
+    // cell with the background colour, which showed as grey boxes behind "SPACE" on the white key.
+    gfx.setTextColor(TFT_BLACK, TFT_WHITE);
     gfx.drawString("SPACE", 238, 728 + r4H / 2);
 
     // Send
@@ -1304,10 +1324,20 @@ void UIEngine::drawAlarmPopup(M5GFX& gfx) {
     gfx.setTextSize(2.5f);
     gfx.drawString("ALARM", X + W / 2, Y + 25);
 
-    const char* name = AlarmService::getInstance().ringingName();
+    // Alarm name: local data (typed on the keyboard or read back from /monomesh/alarms.txt), so it
+    // can carry control bytes or be longer than the popup. Sanitize and clip it to the box.
+    char nameBuf[64];
+    sanitizeDisplayText(AlarmService::getInstance().ringingName(), nameBuf, sizeof(nameBuf));
+    for (char* q = nameBuf; *q != '\0'; ++q) {
+        if (*q == '\n') *q = ' '; // single-line popup title
+    }
     gfx.setTextColor(TFT_BLACK, TFT_WHITE);
     gfx.setTextSize(3);
-    gfx.drawString(name, X + W / 2, Y + 92);
+    size_t nameLen = strlen(nameBuf);
+    while (nameLen > 1 && gfx.textWidth(nameBuf) > W - 40) {
+        nameBuf[--nameLen] = '\0';
+    }
+    gfx.drawString(nameBuf, X + W / 2, Y + 92);
 
     int hh = 0, mm = 0, ss = 0;
     BSP::getInstance().getRtcTime(hh, mm, ss);

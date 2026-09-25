@@ -12,7 +12,8 @@ struct EvalResult {
 };
 
 // Evaluates an expression typed on the CALC keypad. The string uses the same characters shown on
-// the display: digits, '.', 'x' for multiply, '/', '+', '-', '%' and parentheses. Grammar
+// the display: digits, '.', 'x' for multiply, '/', '+', '-', '%' and parentheses. A number may also
+// carry an exponent ("1.5e+13") when it is the re-inserted result of a previous '='. Grammar
 // (recursive descent):
 //   expr    := term (('+' | '-') term)*
 //   term    := factor (('x' | '/') factor)*

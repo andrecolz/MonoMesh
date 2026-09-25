@@ -39,7 +39,9 @@ private:
     void pressKey(int index);
 
     // Input helpers.
-    void startFreshIfResult();
+    // `startNewNumber` = true for the keys that begin a new numeric literal (digit, dot): after a
+    // result they must clear the expression instead of appending to the result text.
+    void startFreshIfResult(bool startNewNumber);
     void appendDigit(char d);
     void appendOperator(char op);
     void appendDot();

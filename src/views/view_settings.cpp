@@ -181,6 +181,14 @@ static const char* volumeLabel(uint8_t vol) {
     }
 }
 
+// The stored frontlight can exceed 100 (hand-edited config.json recovered into NVS): setFrontlight
+// clamps on write, but the getter returns the raw byte, so the slider would position its knob past
+// the track. Clamp where the value enters the view.
+static uint8_t clampedFrontlight() {
+    const uint8_t fl = MeshService::getInstance().getFrontlight();
+    return fl > 100 ? 100 : fl;
+}
+
 // Clock face selection index, shared by the value row and the picker: 0 = portrait, 1 = landscape,
 // 2 = portrait 180°, 3 = landscape 180°. The low bit is landscape, the high bit the 180° flip, so
 // CLOCK_LABELS can stay indexed by it.
@@ -198,7 +206,7 @@ static int dutyIndexFromValue(int pct) {
 // ---------------------------------------------------------------- lifecycle
 void ViewSettings::onEnter() {
     _dragRow = -1;
-    _sliderBrightness = MeshService::getInstance().getFrontlight();
+    _sliderBrightness = clampedFrontlight();
     _sliderVolume = BSP::getInstance().getBuzzerVolume();
     _arrowHeld = 0;
     // A pending save is flushed when leaving the tab anyway; nothing to restore here.
@@ -296,7 +304,7 @@ void ViewSettings::gotoPage(Page page) {
     _dragRow = -1;
     _arrowHeld = 0;
     if (page == Page::System) {
-        _sliderBrightness = MeshService::getInstance().getFrontlight();
+        _sliderBrightness = clampedFrontlight();
         _sliderVolume = BSP::getInstance().getBuzzerVolume();
     }
     drawPage(M5.Display);
@@ -393,7 +401,7 @@ void ViewSettings::drawSystem(M5GFX& gfx, int onlyRow) {
     // While not dragging, follow the live values: the quick menu can change brightness/volume with
     // this page on screen.
     if (_dragRow < 0) {
-        _sliderBrightness = ms.getFrontlight();
+        _sliderBrightness = clampedFrontlight();
         _sliderVolume = BSP::getInstance().getBuzzerVolume();
     }
 
@@ -480,7 +488,9 @@ void ViewSettings::drawChannels(M5GFX& gfx, int onlyRow) {
     layoutRows(CHANNEL_ROWS, CHANNEL_N, r);
 
     if (onlyRow < 0 || onlyRow == 0) {
-        valueRow(gfx, r[0], CHANNEL_ROWS[0].label, ms.getPrimaryChannelName());
+        char v[20];
+        sanitizeDisplayText(ms.getPrimaryChannelName(), v, sizeof(v));
+        valueRow(gfx, r[0], CHANNEL_ROWS[0].label, v[0] ? v : "-");
     }
     if (onlyRow < 0 || onlyRow == 1) {
         char v[32];
@@ -531,8 +541,18 @@ void ViewSettings::drawNode(M5GFX& gfx, int onlyRow) {
     RowRect r[NODE_N];
     layoutRows(NODE_ROWS, NODE_N, r);
 
-    if (onlyRow < 0 || onlyRow == 0) valueRow(gfx, r[0], NODE_ROWS[0].label, ms.getLocalLongName());
-    if (onlyRow < 0 || onlyRow == 1) valueRow(gfx, r[1], NODE_ROWS[1].label, ms.getLocalShortName());
+    if (onlyRow < 0 || onlyRow == 0) {
+        // Long/short name and channel name can be recovered from config.json or typed on the
+        // keyboard: sanitize them before drawing (control bytes, broken UTF-8).
+        char v[40];
+        sanitizeDisplayText(ms.getLocalLongName(), v, sizeof(v));
+        valueRow(gfx, r[0], NODE_ROWS[0].label, v[0] ? v : "-");
+    }
+    if (onlyRow < 0 || onlyRow == 1) {
+        char v[16];
+        sanitizeDisplayText(ms.getLocalShortName(), v, sizeof(v));
+        valueRow(gfx, r[1], NODE_ROWS[1].label, v[0] ? v : "-");
+    }
     if (onlyRow < 0 || onlyRow == 2) infoRow(gfx, r[2], NODE_ROWS[2].label, ms.getLocalIdStr());
     if (onlyRow < 0 || onlyRow == 3) {
         char v[32];
@@ -802,6 +822,10 @@ void ViewSettings::openSelect(SelectTarget target) {
 void ViewSettings::applySelect(int option) {
     MeshService& ms = MeshService::getInstance();
     if (option >= 0 && option < _selCount) _selIndex = option;
+    // Never index the value tables with -1: a select opened on a stored value that is not in the
+    // list (hand-edited config.json) leaves _selIndex at -1 until an option is tapped.
+    if (_selIndex < 0) _selIndex = 0;
+    if (_selIndex >= _selCount) _selIndex = _selCount - 1;
     switch (_selTarget) {
         case SelectTarget::BuzzerMode:
             BSP::getInstance().setBuzzerMode((BSP::BuzzerMode)_selIndex);

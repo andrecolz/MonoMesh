@@ -128,13 +128,27 @@ static constexpr int BUBBLE_LINE_H = 20;   // size-2 wrapped line pitch
 static constexpr int BUBBLE_GAP = 8;       // vertical gap between bubbles
 // Size-2 GLCD glyphs are 12 px wide: characters that fit in the widest text area.
 static constexpr size_t BUBBLE_LINE_CHARS = (BUBBLE_MAX_W - 2 * BUBBLE_PAD_X) / 12;
+// Height cap for a single bubble (see wrapText): 32 + 10*20 = 232 px, well inside the 568 px page
+// area, so pagination can always show at least one full bubble without touching the compose bar.
+static constexpr size_t BUBBLE_MAX_LINES = 10;
 
 static std::vector<std::string> wrapText(const char* text, size_t maxCharsPerLine = 31) {
     std::vector<std::string> lines;
     if (!text || *text == '\0') return lines;
 
+    // One bubble must never be taller than the page: a 224 B message made of "a\n" pairs wraps to
+    // 112 lines (2272 px), which would be drawn over the compose bar and would push every following
+    // bubble off screen. Sanitize the bytes first (see sanitizeDisplayText) and cap the height at
+    // BUBBLE_MAX_LINES, with "..." on the last line.
+    char clean[256];
+    sanitizeDisplayText(text, clean, sizeof(clean));
+    if (clean[0] == '\0') {
+        lines.push_back("");
+        return lines;
+    }
+
     std::string currentLine;
-    const char* p = text;
+    const char* p = clean;
 
     while (*p) {
         while (*p == ' ') {
@@ -202,6 +216,18 @@ static std::vector<std::string> wrapText(const char* text, size_t maxCharsPerLin
     }
 
     if (lines.empty()) lines.push_back("");
+    if (lines.size() > BUBBLE_MAX_LINES) {
+        lines.resize(BUBBLE_MAX_LINES);
+        std::string& last = lines.back();
+        if (maxCharsPerLine > 3 && last.size() > maxCharsPerLine - 3) {
+            last.resize(maxCharsPerLine - 3);
+            // resize() cuts on a byte boundary: do not leave a dangling UTF-8 lead byte, or the
+            // following "..." is decoded as a continuation and renders as a garbage glyph.
+            while (!last.empty() && ((unsigned char)last.back() & 0xC0) == 0x80) last.pop_back();
+            if (!last.empty() && (unsigned char)last.back() >= 0xC0) last.pop_back();
+        }
+        last += "...";
+    }
     return lines;
 }
 
@@ -404,9 +430,15 @@ void ViewChat::drawConversationList(M5GFX& gfx) {
 
         char label[64];
         if (it.isChannel) {
-            snprintf(label, sizeof(label), "PRIMARY CHANNEL %s", it.channelPreset.c_str());
+            // The preset label can come from a saved-message row (hand-edited CSV/NVS): sanitize it
+            // and keep it short enough not to reach the timestamp.
+            char chName[20];
+            sanitizeDisplayText(it.channelPreset.c_str(), chName, sizeof(chName));
+            snprintf(label, sizeof(label), "PRIMARY CHANNEL %.12s", chName);
         } else {
-            snprintf(label, sizeof(label), "%s", it.shortName.c_str());
+            char dmName[20];
+            sanitizeDisplayText(it.shortName.c_str(), dmName, sizeof(dmName));
+            snprintf(label, sizeof(label), "%s", dmName[0] ? dmName : "(node)");
         }
         gfx.drawString(label, 26, y + cardH / 2);
 
@@ -488,11 +520,14 @@ void ViewChat::drawChatMessages(M5GFX& gfx) {
 
     char headerText[64];
     if (s_mode == ChatMode::ChannelChat) {
-        snprintf(headerText, sizeof(headerText), "PRIMARY CHANNEL %s", s_activeChannelPreset.c_str());
+        char chName[20];
+        sanitizeDisplayText(s_activeChannelPreset.c_str(), chName, sizeof(chName));
+        snprintf(headerText, sizeof(headerText), "PRIMARY CHANNEL %.16s", chName);
     } else {
         const MeshNode* n = MeshService::getInstance().findNode(s_activeTargetNode);
-        const char* sName = n ? n->shortName : "";
-        snprintf(headerText, sizeof(headerText), "DM: %s", (sName && strlen(sName) > 0) ? sName : "NODE");
+        char dmName[20];
+        sanitizeDisplayText(n ? n->shortName : "", dmName, sizeof(dmName));
+        snprintf(headerText, sizeof(headerText), "DM: %.16s", dmName[0] ? dmName : "NODE");
     }
     gfx.drawString(headerText, 18, 60);
 
@@ -519,13 +554,17 @@ void ViewChat::drawChatMessages(M5GFX& gfx) {
             int boxH = 32 + (int)lines.size() * BUBBLE_LINE_H;
 
             // Header left side: "YOU" for outgoing, sender (+ SNR on channels) for incoming.
+            // senderShort comes from the peer's NodeInfo: sanitize it before drawing.
+            char sender[12];
+            sanitizeDisplayText(msg.senderShort, sender, sizeof(sender));
+            if (sender[0] == '\0') snprintf(sender, sizeof(sender), "?");
             char headLeft[48];
             if (msg.isOutgoing) {
                 snprintf(headLeft, sizeof(headLeft), "YOU");
             } else if (s_mode == ChatMode::ChannelChat) {
-                snprintf(headLeft, sizeof(headLeft), "%s | SNR: %.0fdB", msg.senderShort, msg.snr);
+                snprintf(headLeft, sizeof(headLeft), "%s | SNR: %.0fdB", sender, msg.snr);
             } else {
-                snprintf(headLeft, sizeof(headLeft), "%s", msg.senderShort);
+                snprintf(headLeft, sizeof(headLeft), "%s", sender);
             }
             const char* timeStr = msg.timeStr[0] ? msg.timeStr : "--:--";
 

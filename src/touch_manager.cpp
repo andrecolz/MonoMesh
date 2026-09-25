@@ -41,6 +41,19 @@ void TouchManager::update() {
     // Check if finger is currently on screen
     if (!M5.Touch.getCount()) {
         if (_isPressed) {
+            // A failed I2C read makes getCount() report 0 while the controller's INT line is still
+            // asserted: releasing here would synthesise a Click (or Up) under a finger that never
+            // moved. Give the panel a bounded grace window to report the release; if the INT line
+            // is not usable, trust getCount() exactly as before. The first glitch poll must return
+            // too, otherwise the release happens before the window can ever be observed.
+            if (intUsable && panelActive) {
+                if (_lostTouchSince == 0) {
+                    _lostTouchSince = now ? now : 1;
+                    return;
+                }
+                if (now - _lostTouchSince < 300) return;
+            }
+            _lostTouchSince = 0;
             _isPressed = false;
             int16_t dx = _curX - _downX;
             int16_t dy = _curY - _downY;
@@ -91,9 +104,17 @@ void TouchManager::update() {
 
     _curX = rx;
     _curY = ry;
+    _lostTouchSince = 0; // the panel is answering again: drop any glitch grace window
 
-    if (!_isPressed) {
+    // A contact id that changes while a press is still tracked means the previous finger was never
+    // seen going up (missed release / very fast re-tap): start a new gesture from this point instead
+    // of measuring the new tap against the old down point and duration.
+    const bool newContact = _isPressed && raw.id != _downId &&
+                            (abs((int)rx - _downX) + abs((int)ry - _downY) > 24);
+
+    if (!_isPressed || newContact) {
         _isPressed = true;
+        _downId = raw.id;
         _downX = rx;
         _downY = ry;
         _downTime = millis();

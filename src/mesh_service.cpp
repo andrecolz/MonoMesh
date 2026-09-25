@@ -43,6 +43,18 @@ static void aes128CtrCrypt(const uint8_t* key, uint64_t packetId, uint32_t fromN
     aesCtrCryptN(key, 16, packetId, fromNode, input, len, output);
 }
 
+// Channel transport with "encryption disabled" (0-byte PSK, official Channels::getKey()): the
+// payload travels in clear. A null/zero-length key must be a byte copy, not a 128-bit AES key read
+// of an unrelated buffer, and the RX side must try the same cleartext candidate.
+static void channelCryptN(const uint8_t* key, uint8_t keyLen, uint32_t packetId, uint32_t fromNode,
+                          const uint8_t* in, size_t len, uint8_t* out) {
+    if (!key || keyLen == 0) {
+        memcpy(out, in, len);
+        return;
+    }
+    aesCtrCryptN(key, keyLen, packetId, fromNode, in, len, out);
+}
+
 // Meshtastic PKI (X25519 ECDH -> SHA-256 -> AES-256-CCM, 8-byte tag, 12-byte overhead)
 // Shared key KDF: SHA256(X25519(local_private, remote_public))
 static bool pkiDeriveKey(const uint8_t* peerPubKey, const uint8_t* myPrivKey, uint8_t outKey[32]) {
@@ -188,7 +200,9 @@ static bool pbValidateData(const uint8_t* data, size_t len, uint32_t& portnumOut
         }
     }
 
-    if (!portnumSeen || portnum == 0 || portnum > 300) return false;
+    // PortNum_MAX is 511 (custom/private apps live in 256..511): a lower ceiling rejected valid
+    // traffic from peers using private portnums and threw it on the opaque-relay path.
+    if (!portnumSeen || portnum == 0 || portnum > 511) return false;
     portnumOut = portnum;
     payloadOut = payload;
     payloadLenOut = payloadLen;
@@ -205,6 +219,19 @@ static bool looksLikeText(const uint8_t* data, size_t len) {
         if (c == 0x7F) return false;
     }
     return true;
+}
+
+// Chat text is stored in the CSV/NVS and drawn with the GLCD font. Control bytes (including CR/LF,
+// which the chat view already treats as word separators) would only render as garbage glyphs, so
+// map them to spaces before saving/serialising. Newlines are kept for chat bubbles (the wrapper
+// uses them as line breaks); the CSV writer turns them into spaces when persisting.
+static void sanitizeChatText(char* text, bool keepNewlines = false) {
+    if (!text) return;
+    for (char* p = text; *p; ++p) {
+        const unsigned char c = (unsigned char)*p;
+        if (c == '\n' && keepNewlines) continue;
+        if (c < 0x20 || c == 0x7F) *p = ' ';
+    }
 }
 
 static const char* routingErrorName(uint32_t code) {
@@ -898,6 +925,9 @@ bool MeshService::suspendRadio() {
     if (state != RADIOLIB_ERR_NONE) {
         // Do not mark the radio suspended when the chip refused to sleep: the CLOCK mode would then
         // assume ~uA consumption while the chip is still in RX (and the resume path would misfire).
+        // Best effort: re-arm RX, a half-executed sleep command can otherwise leave the chip deaf.
+        _radio->standby();
+        _radio->startReceive();
         unlockRadio();
         ESP_LOGW(TAG, "SX1262 sleep returned %d (radio may still be drawing RX current)", state);
         return false;
@@ -1174,6 +1204,16 @@ void MeshService::processPacket(uint8_t* payload, size_t len, float snr, float r
     const bool isBroadcastTo = (to == NODENUM_BROADCAST);
     const bool isToUs = (to == _localNodeNum);
 
+    // Malformed/mqtt headers: node 0 and packet id 0 are never emitted by the official firmware, and
+    // a frame with hop_start < hop_limit breaks hop accounting (official classifyHopStart() drops it
+    // as INVALID). hop_limit == 0 is legitimate: a packet can be delivered on its last hop and the
+    // official firmware classifies hop_start=7/hop_limit=0 as VALID (test_hop_start_policy).
+    if (to == 0 || id == 0) return;
+    if (hopStart < hopLimit) return;
+    // via_mqtt frames belong to an MQTT gateway: the official firmware drops them on RF
+    // (lora.ignore_mqtt, the default in duty-cycle regions) to prevent routing storms.
+    if (hdr->flags & 0x10) return;
+
     _rxTotal++;
 
     // Packets echoed back by the mesh (our own transmission relayed by another node)
@@ -1246,6 +1286,7 @@ void MeshService::processPacket(uint8_t* payload, size_t len, float snr, float r
                         ESP_LOGI(TAG, "PKI decrypted packet 0x%08x from !%08x (portnum %u)", (unsigned)id, (unsigned)from, portnum);
                     }
                 }
+                sodium_memzero(pkiKey, sizeof(pkiKey));
             }
             if (!decoded) {
                 ESP_LOGW(TAG, "PKI packet 0x%08x from !%08x not decryptable (key unknown or stale)", (unsigned)id, (unsigned)from);
@@ -1255,8 +1296,10 @@ void MeshService::processPacket(uint8_t* payload, size_t len, float snr, float r
                 }
                 // The peer may hold a missing or stale copy of *our* public key (a regenerated keypair
                 // is the classic case: their NodeDB then refuses our NodeInfo updates). Re-announce
-                // ourselves, rate-limited by the normal NodeInfo interval check.
-                if (millis() - _lastNodeInfoTx > 60000) {
+                // ourselves. Only for peers we know (a bogus channel-0 frame from an unknown sender
+                // must not force a broadcast) and inside the per-sender reply budget.
+                if (peer && peer->hasPublicKey && millis() - _lastNodeInfoTx > 60000 &&
+                    allowAutoReply(from)) {
                     ESP_LOGW(TAG, "Re-announcing our NodeInfo so !%08x can refresh our public key", (unsigned)from);
                     broadcastNodeInfo(false);
                 }
@@ -1269,8 +1312,10 @@ void MeshService::processPacket(uint8_t* payload, size_t len, float snr, float r
             uint8_t candLens[5] = {0};
             int candCount = 0;
 
+            // klen 0 is the "encryption disabled" channel: the candidate must still be tried (as a
+            // plaintext copy) or a node configured with an empty PSK could never read its own channel.
             auto addCandidate = [&](const uint8_t* k, uint8_t klen) {
-                if (!k || klen == 0 || klen > 32) return;
+                if (!k || klen > 32) return;
                 for (int i = 0; i < candCount; ++i) {
                     if (candLens[i] == klen && memcmp(candidates[i], k, klen) == 0) return;
                 }
@@ -1294,11 +1339,13 @@ void MeshService::processPacket(uint8_t* payload, size_t len, float snr, float r
                     break;
                 }
             }
-            // Last resort: our own primary key (helps when peer channel names differ)
-            addCandidate(_primaryPsk, _primaryPskLen);
+            // Last resort: our own primary key (helps when peer channel names differ). Skipped for a
+            // cleartext channel (0-byte PSK): there is no key, and trying plaintext against every
+            // foreign hash would accept unencrypted garbage from unrelated channels.
+            if (_primaryPskLen > 0) addCandidate(_primaryPsk, _primaryPskLen);
 
             for (int i = 0; i < candCount && !decoded; ++i) {
-                aesCtrCryptN(candidates[i], candLens[i], id, from, cipherData, cipherLen, plainData);
+                channelCryptN(candidates[i], candLens[i], id, from, cipherData, cipherLen, plainData);
                 uint32_t candPort = 0;
                 const uint8_t* candApp = nullptr;
                 size_t candAppLen = 0;
@@ -1331,8 +1378,11 @@ void MeshService::processPacket(uint8_t* payload, size_t len, float snr, float r
         const uint8_t newHop = hopLimit - 1;
         bool queued = false;
 
-        // Traceroute packets must be re-encoded hop by hop (each hop appends id + SNR)
-        if (decoded && portnum == 70 && keyUsedLen > 0 && appPayload && appPayloadLen > 0) {
+        // Traceroute packets must be re-encoded hop by hop (each hop appends id + SNR). PKI-decoded
+        // traceroute (not an official encoding) stays on the opaque path; a channel-decoded one
+        // always re-encodes, even with an empty payload (the official appends to the empty request
+        // too, and requiring appPayloadLen > 0 used to drop the forward route entirely).
+        if (decoded && portnum == 70 && !pkiDecoded) {
             // request_id == 0 -> request (append to route/snr_towards);
             // request_id != 0 -> reply  (append to route_back/snr_back)
             const bool tracerouteIsReply = (pbDataRequestId(plainData, plainLen) != 0);
@@ -1341,7 +1391,7 @@ void MeshService::processPacket(uint8_t* payload, size_t len, float snr, float r
             if (buildTraceroutePayload(newPlain, sizeof(newPlain), newPlainLen, appPayload, appPayloadLen,
                                        tracerouteIsReply, /*appendId=*/true, _localNodeNum, snr)) {
                 uint8_t encBuf[256];
-                aesCtrCryptN(keyUsed, keyUsedLen, id, from, newPlain, newPlainLen, encBuf);
+                channelCryptN(keyUsed, keyUsedLen, id, from, newPlain, newPlainLen, encBuf);
                 PendingRelay pr;
                 memcpy(pr.packet, payload, sizeof(MeshtasticHeader));
                 memcpy(pr.packet + sizeof(MeshtasticHeader), encBuf, newPlainLen);
@@ -1385,7 +1435,13 @@ void MeshService::processPacket(uint8_t* payload, size_t len, float snr, float r
                      (unsigned)(len - sizeof(MeshtasticHeader)), (unsigned)getChannelHash());
         }
         if (!isToUs && !isBroadcastTo) {
-            updateNode(from, "", "", snr, rssi);
+            // Refresh only senders we already know: creating NodeDB entries from opaque frames
+            // addressed to a third party let anyone with a transmitter flush the whole node list
+            // (and the stored public keys) with ~128 spoofed senders. Relaying does not need the
+            // entry, and a real discovery packet (broadcast, or decoded for us) still creates it.
+            if (findNode(from)) {
+                updateNode(from, "", "", snr, rssi);
+            }
             updateNodeHops(from, hopsTaken);
         }
         // Opaque relay: like the official firmware, forward packets we cannot decrypt (traffic on a
@@ -1630,6 +1686,9 @@ void MeshService::handleDecryptedData(uint32_t from, uint32_t to, uint32_t id, c
         size_t cpyLen = appPayloadLen < (sizeof(msg.text) - 1) ? appPayloadLen : (sizeof(msg.text) - 1);
         memcpy(msg.text, appPayload, cpyLen);
         msg.text[cpyLen] = '\0';
+        // PKI-decoded DMs skip looksLikeText(): never let control bytes reach the GLCD/CSV, but keep
+        // the newlines the chat bubble wrapper uses as line breaks.
+        sanitizeChatText(msg.text, true);
 
         if (to == NODENUM_BROADCAST) {
             _broadcastMessages.push_back(msg);
@@ -1731,6 +1790,10 @@ void MeshService::handleDecryptedData(uint32_t from, uint32_t to, uint32_t id, c
             } else break;
         }
 
+        // Names are drawn by the UI and printed in the log: strip control bytes (a peer could send
+        // ANSI escapes / newlines) without touching UTF-8 code points.
+        sanitizeChatText(longName);
+        sanitizeChatText(shortName);
         updateNode(from, longName, shortName, snr, rssi, hasPubKey ? pubKey : nullptr, 0, 0.0f, roleVal,
                    hwModel, isLicensed, isUnmessagable);
         if (hasMac) {
@@ -1755,7 +1818,11 @@ void MeshService::handleDecryptedData(uint32_t from, uint32_t to, uint32_t id, c
         // Empty payload = app asking for our device metrics (battery / ch-util / air-util)
         if (!appPayload || appPayloadLen == 0) {
             ESP_LOGI(TAG, "Telemetry request from !%08x (no payload)", (unsigned)from);
-            if (wantResponse && from != _localNodeNum) {
+            // Official firmware refuses multi-hop broadcast requests for telemetry (only a sensor or
+            // router role answers them): answering any broadcast would let one frame pull a reply
+            // out of every listening node. Unicast requests are always answered (rate limited).
+            if (wantResponse && from != _localNodeNum && (isToUs || hopsTaken == 0) &&
+                allowAutoReply(from)) {
                 queueDeferred(DeferredKind::TelemetryUnicast, from, 400 + (esp_random() % 600), id);
             }
             return;
@@ -1917,7 +1984,8 @@ void MeshService::handleDecryptedData(uint32_t from, uint32_t to, uint32_t id, c
                 }
             }
         }
-        if (wantResponse && from != _localNodeNum) {
+        if (wantResponse && from != _localNodeNum && (isToUs || hopsTaken == 0) &&
+            allowAutoReply(from)) {
             queueDeferred(DeferredKind::TelemetryUnicast, from, 400 + (esp_random() % 600), id);
         }
 
@@ -1926,7 +1994,7 @@ void MeshService::handleDecryptedData(uint32_t from, uint32_t to, uint32_t id, c
         // Empty payload = app asking for our position
         if (!appPayload || appPayloadLen == 0) {
             ESP_LOGI(TAG, "Position request from !%08x (no payload)", (unsigned)from);
-            if (wantResponse && from != _localNodeNum) {
+            if (wantResponse && from != _localNodeNum && allowAutoReply(from)) {
                 queueDeferred(DeferredKind::PositionUnicast, from, 400 + (esp_random() % 600), id);
             }
             return;
@@ -1978,7 +2046,7 @@ void MeshService::handleDecryptedData(uint32_t from, uint32_t to, uint32_t id, c
             ESP_LOGI(TAG, "Position for !%08x: %.5f, %.5f, alt=%d", (unsigned)from, lat, lon, alt);
             uiNeedsRefresh = true;
         }
-        if (wantResponse && from != _localNodeNum) {
+        if (wantResponse && from != _localNodeNum && allowAutoReply(from)) {
             queueDeferred(DeferredKind::PositionUnicast, from, 400 + (esp_random() % 600), id);
         }
 
@@ -1987,9 +2055,11 @@ void MeshService::handleDecryptedData(uint32_t from, uint32_t to, uint32_t id, c
     // sendTraceroute() encode "no route yet" as an empty payload, so do not require appPayloadLen > 0
     // for requests (requestId == 0), or the traceroute would never get an answer.
     } else if (portnum == 70 && (appPayloadLen > 0 || requestId == 0)) {
+        // No unconditional UI refresh here: a traceroute broadcast (or a request we only relay)
+        // changes nothing on screen, and refreshing for every such frame let a spammer drive the
+        // e-paper. handleTracerouteReceived() refreshes when a result is actually stored.
         handleTracerouteReceived(from, to, id, appPayload, appPayloadLen, requestId != 0, chanKey, chanKeyLen,
                                  chanHash, snr);
-        uiNeedsRefresh = true;
 
     // ---------------- WAYPOINT_APP ----------------
     } else if (portnum == 8 && appPayload && appPayloadLen > 0) {
@@ -2041,11 +2111,15 @@ void MeshService::handleDecryptedData(uint32_t from, uint32_t to, uint32_t id, c
             wp.lat = wLatI * 1e-7;
             wp.lon = wLonI * 1e-7;
             strncpy(wp.name, wName, sizeof(wp.name) - 1);
+            wp.name[sizeof(wp.name) - 1] = '\0';
+            sanitizeChatText(wp.name);
             wp.expire = wExpire;
             wp.receivedAt = millis();
             bool replaced = false;
+            // Match (sender, id): matching on the id alone let any node overwrite another node's
+            // waypoint by reusing its 32-bit id.
             for (auto& w : _waypoints) {
-                if (w.id == wpId) { w = wp; replaced = true; break; }
+                if (w.id == wpId && w.fromNode == wp.fromNode) { w = wp; replaced = true; break; }
             }
             if (!replaced) {
                 if (_waypoints.size() >= 16) _waypoints.erase(_waypoints.begin());
@@ -2075,6 +2149,7 @@ void MeshService::handleDecryptedData(uint32_t from, uint32_t to, uint32_t id, c
             }
         }
         if (statusText[0] != '\0') {
+            sanitizeChatText(statusText);
             for (auto& n : _nodes) {
                 if (n.nodeNum == from) {
                     strncpy(n.statusText, statusText, sizeof(n.statusText) - 1);
@@ -2657,7 +2732,10 @@ bool MeshService::sendDataPacket(uint32_t dest, uint32_t portnum, const uint8_t*
     size_t cipherLen = 0;
     uint8_t chanHash = (forceChanHash >= 0) ? (uint8_t)forceChanHash : getTxChannelHash();
     if (usePki) {
-        if (!pkiEncryptPayload(pkiKey, pktId, _localNodeNum, dataBuf, dLen, cipherData)) {
+        const bool encOk = pkiEncryptPayload(pkiKey, pktId, _localNodeNum, dataBuf, dLen, cipherData);
+        // The derived ECDH key is not needed after the encryption: do not leave it on the stack.
+        sodium_memzero(pkiKey, sizeof(pkiKey));
+        if (!encOk) {
             ESP_LOGE(TAG, "PKI encryption failed for !%08x", (unsigned)dest);
             return false;
         }
@@ -2667,7 +2745,7 @@ bool MeshService::sendDataPacket(uint32_t dest, uint32_t portnum, const uint8_t*
         // instead of whatever channel we currently transmit on.
         const uint8_t* encKey = forceKey ? forceKey : getTxChannelKey();
         uint8_t encKeyLen = forceKey ? forceKeyLen : getTxChannelKeyLen();
-        aesCtrCryptN(encKey, encKeyLen, pktId, _localNodeNum, dataBuf, dLen, cipherData);
+        channelCryptN(encKey, encKeyLen, pktId, _localNodeNum, dataBuf, dLen, cipherData);
         cipherLen = dLen;
         if (!isBroadcast && allowPki && (portnum == 1 || portnum == 67)) {
             const MeshNode* peer = findNode(dest);
@@ -2762,7 +2840,7 @@ bool MeshService::sendBroadcastMessage(const char* text, const char* channelName
 
     const uint32_t pktId = (uint32_t)esp_random() | 1u;
     uint8_t cipherData[256];
-    aesCtrCryptN(encKey, encKeyLen, pktId, _localNodeNum, dataBuf, dLen, cipherData);
+    channelCryptN(encKey, encKeyLen, pktId, _localNodeNum, dataBuf, dLen, cipherData);
 
     uint8_t packet[300];
     MeshtasticHeader* hdr = reinterpret_cast<MeshtasticHeader*>(packet);
@@ -2911,6 +2989,13 @@ bool MeshService::sendDirectMessage(uint32_t toNode, const char* text) {
     }
     memcpy(pa.rawPacket, raw, rawLen);
     pa.rawPacketLen = rawLen;
+    // Bounded like every other queue: without a cap, sending DMs back to back grew the retry list
+    // (~0.5 KB each) without limit. The packet already went out; only its retry tracking is skipped.
+    if (_pendingAcks.size() >= MAX_PENDING_ACKS) {
+        ESP_LOGW(TAG, "ACK retry queue full (%u), not tracking DM 0x%08x",
+                 (unsigned)_pendingAcks.size(), (unsigned)pktId);
+        return true;
+    }
     _pendingAcks.push_back(pa);
     return true;
 }
@@ -3002,6 +3087,12 @@ void MeshService::handleNodeInfoRequest(uint32_t from, bool wantResponse, uint32
             ESP_LOGD(TAG, "NodeInfo reply to !%08x suppressed (node reply within 60s)", (unsigned)from);
             return;
         }
+    }
+
+    // Uniform per-sender budget shared with the other automatic replies (anti-amplification).
+    if (!allowAutoReply(from)) {
+        ESP_LOGD(TAG, "NodeInfo reply to !%08x suppressed (per-sender reply budget)", (unsigned)from);
+        return;
     }
 
     // Mark the throttles only once the reply is actually queued: a full deferred queue must not
@@ -3127,6 +3218,10 @@ void MeshService::broadcastTelemetry() {
 // Official PositionModule::allocReply() refuses a reply sent less than 3 minutes ago: a peer asking in
 // a loop must not be able to turn us into a position beacon (each reply also costs airtime/battery).
 static constexpr uint32_t POSITION_REPLY_MIN_INTERVAL_MS = 3UL * 60UL * 1000UL;
+
+// Global spacing between traceroute replies (in addition to the per-sender budget): the reply
+// re-encodes the whole route and is larger than the request, so one request must not buy many.
+static constexpr uint32_t TRACEROUTE_REPLY_MIN_INTERVAL_MS = 3000;
 
 void MeshService::sendPositionTo(uint32_t dest, uint8_t precisionBits, bool wantResponse, uint32_t requestId) {
     if (_nodes.empty() || !_nodes[0].hasPosition) return;
@@ -3473,10 +3568,20 @@ void MeshService::handleTracerouteReceived(uint32_t from, uint32_t to, uint32_t 
     if (isToUs && !isResponse) {
         // We are the destination: append our SNR and reply to the originator. The reply goes out on
         // the channel (key + hash) the request came in on, or the originator could not decrypt it.
+        // Anti-amplification: a small request makes us build and send a (longer) route reply, so
+        // only answer inside a global spacing and the per-sender reply budget.
+        uint32_t now = millis();
+        if ((_lastTracerouteReplyMillis != 0 &&
+             (now - _lastTracerouteReplyMillis) < TRACEROUTE_REPLY_MIN_INTERVAL_MS) ||
+            !allowAutoReply(from)) {
+            ESP_LOGD(TAG, "Traceroute request from !%08x not answered (reply throttle)", (unsigned)from);
+            return;
+        }
         uint8_t replyPayload[233];
         size_t replyLen = 0;
         if (buildTraceroutePayload(replyPayload, sizeof(replyPayload), replyLen, payload, len,
                                    /*isResponse=*/false, /*appendId=*/false, _localNodeNum, snr)) {
+            _lastTracerouteReplyMillis = millis();
             sendTracerouteReply(from, id, replyPayload, replyLen, chanKey, chanKeyLen, chanHash);
         }
         return;
@@ -3592,6 +3697,38 @@ void MeshService::handleTracerouteReceived(uint32_t from, uint32_t to, uint32_t 
         ESP_LOGI(TAG, "Traceroute result: %s", res.text);
         UIEngine::getInstance().requestFullRefresh();
     }
+}
+
+// Windowed per-sender budget for automatic unicast replies. Keeps a fixed table (no heap): entries
+// are reused round-robin, and a sender that never asks again simply ages out. Returns true when the
+// reply may be sent; false means the request is dropped (never queued).
+bool MeshService::allowAutoReply(uint32_t nodeNum) {
+    if (nodeNum == 0 || nodeNum == NODENUM_BROADCAST) return false;
+    const uint32_t now = millis();
+    int reusable = -1;
+    uint32_t oldestWindow = 0;
+    for (size_t i = 0; i < AUTO_REPLY_SLOTS; ++i) {
+        AutoReplyRate& r = _autoReplyRates[i];
+        if (r.nodeNum == nodeNum) {
+            if ((uint32_t)(now - r.windowStart) >= AUTO_REPLY_WINDOW_MS) {
+                r.windowStart = now;
+                r.count = 0;
+            }
+            if (r.count >= AUTO_REPLY_MAX_PER_WINDOW) return false;
+            r.count++;
+            return true;
+        }
+        if (reusable < 0 || (uint32_t)(now - r.windowStart) > oldestWindow) {
+            oldestWindow = (uint32_t)(now - r.windowStart);
+            reusable = (int)i;
+        }
+    }
+    // The table holds only the 8 most recent requesters; a new sender reuses the least recent slot.
+    AutoReplyRate& r = _autoReplyRates[reusable < 0 ? 0 : (size_t)reusable];
+    r.nodeNum = nodeNum;
+    r.windowStart = now;
+    r.count = 1;
+    return true;
 }
 
 bool MeshService::queueDeferred(DeferredKind kind, uint32_t dest, uint32_t delayMs, uint32_t arg, float snr) {

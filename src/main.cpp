@@ -173,6 +173,19 @@ static void handleLowPowerMode() {
     AlarmService& alarms = AlarmService::getInstance();
     alarms.pollLowPower();
     static bool s_alarmScreen = false;
+
+    // Per-session state reset. These statics outlive the mode (the wake path returns to the normal
+    // loop without a hook), so e.g. a phantom-wake count left at 7 would abort the next session on
+    // its first hiccup, and a stale alarm banner flag would skip the banner redraw after a valve exit.
+    static uint32_t s_sessionStart = 0;
+    const uint32_t sessionStart = bsp.getLowPowerStartMillis();
+    if (sessionStart != s_sessionStart) {
+        s_sessionStart = sessionStart;
+        s_phantomWakes = 0;
+        s_alarmScreen = false;
+        s_clockLightUntil = 0;
+    }
+
     if (alarms.isRinging()) {
         if (!s_alarmScreen) {
             s_alarmScreen = true;
@@ -253,6 +266,7 @@ static void handleLowPowerMode() {
         const uint8_t userFl = mesh.getFrontlight();
         bsp.setFrontlight(userFl > 0 ? userFl : CLOCK_PEEK_BRIGHTNESS);
         s_clockLightUntil = millis() + CLOCK_PEEK_MS;
+        if (s_clockLightUntil == 0) s_clockLightUntil = 1; // wrap-to-0 would leave the light on forever
         ESP_LOGI(TAG, "Clock peek: frontlight on for %u ms (%u%%)",
                  (unsigned)CLOCK_PEEK_MS,
                  (unsigned)(userFl > 0 ? userFl : CLOCK_PEEK_BRIGHTNESS));

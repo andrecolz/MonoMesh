@@ -1,4 +1,5 @@
 #include "view_map.h"
+#include "view_base.h" // sanitizeDisplayText(): mesh names and container strings are untrusted
 #include "../mesh_service.h"
 #include "../ui_engine.h"
 #include "../storage_manager.h"
@@ -54,6 +55,18 @@ double distanceKm(double lat1, double lon1, double lat2, double lon2) {
     const double dLat = (lat2 - lat1) * 111.320;
     const double dLon = (lon2 - lon1) * 111.320 * cos(lat1 * DEG2RAD);
     return sqrt(dLat * dLat + dLon * dLon);
+}
+
+// A PNG read from the card is untrusted input: validate the signature and the IHDR size before
+// handing it to the M5GFX decoder. pngle sizes its scanline buffer from the declared width and a
+// wrapped/absurd dimension can keep the decoder busy for minutes on a few hundred bytes of IDAT.
+// Real map tiles are 256x256, so anything above 1024 is refused.
+bool pngHeaderOk(const uint8_t* data, size_t len) {
+    static const uint8_t kSig[8] = {0x89, 'P', 'N', 'G', '\r', '\n', 0x1A, '\n'};
+    if (!data || len < 33 || memcmp(data, kSig, 8) != 0 || memcmp(data + 12, "IHDR", 4) != 0) return false;
+    const uint32_t w = ((uint32_t)data[16] << 24) | ((uint32_t)data[17] << 16) | ((uint32_t)data[18] << 8) | data[19];
+    const uint32_t h = ((uint32_t)data[20] << 24) | ((uint32_t)data[21] << 16) | ((uint32_t)data[22] << 8) | data[23];
+    return w > 0 && h > 0 && w <= 1024 && h <= 1024;
 }
 
 void tileToLatLon(double tx, double ty, int z, double& lat, double& lon) {
@@ -160,8 +173,16 @@ void ViewMap::releaseCanvas() {
 void ViewMap::toast(const char* fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
-    vsnprintf(_toast, sizeof(_toast), fmt, ap);
+    char raw[sizeof(_toast)];
+    vsnprintf(raw, sizeof(raw), fmt, ap);
     va_end(ap);
+    // Container names come from the card and can carry control bytes: sanitize before drawing.
+    char clean[sizeof(_toast)];
+    sanitizeDisplayText(raw, clean, sizeof(clean));
+    for (char* q = clean; *q != '\0'; ++q) {
+        if (*q == '\n') *q = ' ';
+    }
+    snprintf(_toast, sizeof(_toast), "%s", clean);
     _toastUntilMs = millis() + 2500;
 }
 
@@ -229,11 +250,13 @@ void ViewMap::onEnter() {
 void ViewMap::applyPendingFocus() {
     if (s_focusNodeNum == 0) return;
     const MeshNode* n = MeshService::getInstance().findNode(s_focusNodeNum);
-    if (n && n->hasPosition && (n->lat != 0.0 || n->lon != 0.0)) {
+    // The node coordinates come from the mesh and its zoom from another view: both must be sane
+    // before they reach the Mercator math below.
+    if (n && n->hasPosition && (n->lat != 0.0 || n->lon != 0.0) && validMapCenter(n->lat, n->lon)) {
         _centerLat = n->lat;
         _centerLon = n->lon;
         _selectedNodeNum = n->nodeNum;
-        if (s_focusZoom > 0) {
+        if (s_focusZoom >= ZOOM_MIN && s_focusZoom <= ZOOM_MAX) {
             _zoomLevel = s_focusZoom;
             if (_usePack) _pack.selectZoom(_zoomLevel);
             ensureZoomAvailable();
@@ -372,18 +395,34 @@ bool ViewMap::openRegion(size_t index, bool announce) {
     if (index >= _regions.size()) return false;
     _regionIndex = index;
     if (_pack.open(_regions[index].c_str()) && _pack.tilePx() == TILE_PX) {
-        _usePack = true;
         _zooms.clear();
         for (size_t i = 0; i < _pack.zoomCount(); ++i) {
-            if (const MapPack::ZoomInfo* zi = _pack.zoomAt(i)) _zooms.push_back(zi->z);
+            const MapPack::ZoomInfo* zi = _pack.zoomAt(i);
+            if (!zi) continue;
+            // The zoom byte comes straight from the file: keep only the levels this view can
+            // shift safely, a bogus value would make "1 << _zoomLevel" undefined in composeScene().
+            if (zi->z < ZOOM_MIN || zi->z > ZOOM_MAX) {
+                ESP_LOGW("ViewMap", "%s: zoom level %u out of range, skipped",
+                         _regions[index].c_str(), (unsigned)zi->z);
+                continue;
+            }
+            _zooms.push_back(zi->z);
         }
         std::sort(_zooms.begin(), _zooms.end());
-        invalidateTileCache();
-        if (announce) {
-            toast("Map: %s (Z %d-%d)", _pack.name().c_str(), _pack.firstZoom(), _pack.lastZoom());
+        _zooms.erase(std::unique(_zooms.begin(), _zooms.end()), _zooms.end());
+        if (!_zooms.empty()) {
+            _usePack = true;
+            invalidateTileCache();
+            if (announce) {
+                toast("Map: %s (Z %d-%d)", _pack.name().c_str(), _zooms.front(), _zooms.back());
+            }
+            ESP_LOGI("ViewMap", "active container: %s", _regions[index].c_str());
+            return true;
         }
-        ESP_LOGI("ViewMap", "active container: %s", _regions[index].c_str());
-        return true;
+        // No usable level (crafted/corrupt container): fall through to the same handling as an
+        // unreadable file, instead of leaving the view on a container it cannot draw.
+        ESP_LOGW("ViewMap", "%s: no usable zoom level", _regions[index].c_str());
+        _pack.close();
     }
     if (_pack.isOpen()) {
         // Tile size other than the one this view draws: refuse instead of
@@ -525,7 +564,7 @@ bool ViewMap::loadSlot(int slot, int z, int x, int y) {
         got += (size_t)n;
     }
     f.close();
-    if (got != size) {
+    if (got != size || !pngHeaderOk(buf, size)) {
         free(buf);
         return false;
     }
@@ -618,7 +657,7 @@ void ViewMap::scanZooms() {
         while (File zEntry = dir.openNextFile()) {
             if (zEntry.isDirectory()) {
                 int z = 0;
-                if (parseInt(baseName(zEntry.name()), z) && z >= 1 && z <= 19) {
+                if (parseInt(baseName(zEntry.name()), z) && z >= ZOOM_MIN && z <= ZOOM_MAX) {
                     // Only count levels that really contain tiles (<z>/<x>/<y>.png): a stale empty
                     // directory must not become a zoom step.
                     char zPath[64];
@@ -746,8 +785,20 @@ bool ViewMap::restoreSavedView() {
     int32_t latE7 = 0, lonE7 = 0;
     uint8_t zoom = 13;
     if (!StorageManager::getInstance().loadMapView(latE7, lonE7, zoom)) return false;
-    _centerLat = (double)latE7 / 1e7;
-    _centerLon = (double)lonE7 / 1e7;
+    // NVS is untrusted too: a corrupt or hand-edited entry must not reach the Mercator math, and
+    // an out-of-range zoom would make "1 << _zoomLevel" undefined in composeScene().
+    const double lat = (double)latE7 / 1e7;
+    const double lon = (double)lonE7 / 1e7;
+    if (!validMapCenter(lat, lon)) {
+        ESP_LOGW("ViewMap", "saved centre out of range (%d, %d): ignored", (int)latE7, (int)lonE7);
+        return false;
+    }
+    if (zoom < ZOOM_MIN || zoom > ZOOM_MAX) {
+        ESP_LOGW("ViewMap", "saved zoom %u out of range: using %d", (unsigned)zoom, 13);
+        zoom = 13;
+    }
+    _centerLat = lat;
+    _centerLon = lon;
     _zoomLevel = zoom;
     return true;
 }
@@ -765,7 +816,7 @@ bool ViewMap::centerOnNode() {
     const auto& nodes = MeshService::getInstance().getNodes();
     const uint32_t local = MeshService::getInstance().getLocalNodeNum();
     for (const auto& n : nodes) {
-        if (n.nodeNum == local && n.hasPosition && (n.lat != 0.0 || n.lon != 0.0)) {
+        if (n.nodeNum == local && n.hasPosition && (n.lat != 0.0 || n.lon != 0.0) && validMapCenter(n.lat, n.lon)) {
             _centerLat = n.lat;
             _centerLon = n.lon;
             _selectedNodeNum = n.nodeNum;
@@ -796,6 +847,14 @@ void ViewMap::tileToLatLon(double tx, double ty, int z, double& lat, double& lon
     lat = latRad * RAD2DEG;
 }
 
+bool ViewMap::validMapCenter(double lat, double lon) {
+    // Web Mercator is only defined up to ±85.05112877; inside that range cos(lat) stays large
+    // enough that metersPerPixel() and the marker offsets never run into the int conversions.
+    // The comparisons are false for NaN (and infinity), so a bogus position - a mesh peer can
+    // deliver any int32 as lat/lon and NVS is not trusted either - is rejected before the maths.
+    return lat >= -85.05112877 && lat <= 85.05112877 && lon >= -180.0 && lon <= 180.0;
+}
+
 bool ViewMap::parseInt(const char* s, int& out) {
     if (!s || !*s) return false;
     int value = 0;
@@ -824,7 +883,7 @@ bool ViewMap::parseTileFileName(const char* name, int& out) {
 }
 
 bool ViewMap::tileExistsAt(int z, double lat, double lon) {
-    if (z < 1 || z > 19) return false;
+    if (z < ZOOM_MIN || z > ZOOM_MAX) return false;
     double tx = 0, ty = 0;
     latLonToTile(lat, lon, z, tx, ty);
     const int xi = (int)floor(tx);
@@ -971,6 +1030,9 @@ void ViewMap::composeScene(int x0, int y0, int x1, int y1) {
     y1 = std::min(CV_H, y1);
     if (x0 >= x1 || y0 >= y1) return;
     const bool full = (x0 == 0 && y0 == 0 && x1 == 480 && y1 == CV_H);
+    // Last-resort guard: a zoom outside the Mercator range (corrupt NVS/container) would make the
+    // tile index arithmetic ("1 << _zoomLevel") undefined. The entry points validate it already.
+    if (_zoomLevel < ZOOM_MIN || _zoomLevel > ZOOM_MAX) return;
     const uint32_t tCompose = millis();
     const uint32_t readsBefore = _statTileReads;
 
@@ -1111,7 +1173,7 @@ bool ViewMap::handleTouch(const TouchEvent& ev) {
                     }
                 }
                 _selectedNodeNum = nodes[idx].nodeNum;
-                if (nodes[idx].hasPosition) {
+                if (nodes[idx].hasPosition && validMapCenter(nodes[idx].lat, nodes[idx].lon)) {
                     _centerLat = nodes[idx].lat;
                     _centerLon = nodes[idx].lon;
                 }
@@ -1277,7 +1339,8 @@ void ViewMap::drawNodes(double latRad, double mpp) {
             _canvas.fillCircle(px, py, 8, TFT_DARKGRAY);
             _canvas.fillCircle(px, py, 4, TFT_WHITE);
             char label[20];
-            snprintf(label, sizeof(label), "%s", n.shortName);
+            sanitizeDisplayText(n.shortName, label, sizeof(label));
+            if (label[0] == '\0') snprintf(label, sizeof(label), "--");
             _canvas.drawString(label, px, py + 10);
         }
     }
@@ -1301,7 +1364,8 @@ void ViewMap::drawWaypoints(double latRad, double mpp) {
             _canvas.setTextDatum(textdatum_t::top_center);
             _canvas.setTextSize(1);
             char wlabel[16];
-            snprintf(wlabel, sizeof(wlabel), "%.14s", wp.name);
+            sanitizeDisplayText(wp.name, wlabel, sizeof(wlabel));
+            if (wlabel[0] == '\0') snprintf(wlabel, sizeof(wlabel), "?");
             _canvas.drawString(wlabel, px, py + 8);
         }
     }
@@ -1362,19 +1426,20 @@ void ViewMap::drawActionButtons(lgfx::LGFXBase& gfx) {
 
 // Draws a string clipped to maxW px at the current text size, with "..." when it does not fit:
 // line1 with a 31-char long name is wider than the info card and was cut only by the screen edge.
+// The text is sanitized first (mesh names and SD metadata can carry control bytes/broken UTF-8).
 static void drawStringEllipsized(M5GFX& gfx, const char* text, int x, int y, int maxW) {
-    if (gfx.textWidth(text) <= maxW) {
-        gfx.drawString(text, x, y);
+    char clean[128];
+    sanitizeDisplayText(text, clean, sizeof(clean));
+    if (gfx.textWidth(clean) <= maxW) {
+        gfx.drawString(clean, x, y);
         return;
     }
-    char buf[96];
-    snprintf(buf, sizeof(buf), "%s", text);
-    size_t len = strlen(buf);
+    size_t len = strlen(clean);
     const int dotsW = gfx.textWidth("...");
-    while (len > 0 && gfx.textWidth(buf) + dotsW > maxW) buf[--len] = '\0';
-    while (len > 0 && buf[len - 1] == ' ') buf[--len] = '\0';
-    snprintf(buf + len, sizeof(buf) - len, "...");
-    gfx.drawString(buf, x, y);
+    while (len > 0 && gfx.textWidth(clean) + dotsW > maxW) clean[--len] = '\0';
+    while (len > 0 && clean[len - 1] == ' ') clean[--len] = '\0';
+    snprintf(clean + len, sizeof(clean) - len, "...");
+    gfx.drawString(clean, x, y);
 }
 
 void ViewMap::drawInfoCard(M5GFX& gfx) {
@@ -1389,7 +1454,9 @@ void ViewMap::drawInfoCard(M5GFX& gfx) {
     gfx.setTextSize(1);
 
     if (!sel) {
-        gfx.drawString(_usePack ? _pack.name().c_str() : "No mesh node selected",
+        char packName[64];
+        sanitizeDisplayText(_usePack ? _pack.name().c_str() : "No mesh node selected", packName, sizeof(packName));
+        gfx.drawString(packName[0] ? packName : "No mesh node selected",
                        22, CARD_Y + CARD_H / 2);
         return;
     }
@@ -1403,7 +1470,9 @@ void ViewMap::drawInfoCard(M5GFX& gfx) {
     // container carries its own attribution; the PNG tree is the OSM "Toner" style.
     char line2[96];
     if (_usePack && !_pack.attribution().empty()) {
-        snprintf(line2, sizeof(line2), "%.90s", _pack.attribution().c_str());
+        char attr[96];
+        sanitizeDisplayText(_pack.attribution().c_str(), attr, sizeof(attr));
+        snprintf(line2, sizeof(line2), "%.90s", attr);
     } else {
         snprintf(line2, sizeof(line2), "Map data (c) OpenStreetMap contributors | Toner style (Stamen)");
     }

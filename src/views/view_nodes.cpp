@@ -19,6 +19,14 @@ void ViewNodes::onEnter() {
 }
 
 void ViewNodes::update() {
+    // The selected node can vanish while the context menu is up (NodeDB eviction when the DB is
+    // full, or a "clear nodes" from another screen): the menu would stay invisible but clickable,
+    // still offering DM/traceroute for a node that is gone. Close it at the next loop instead.
+    if (_modalOpen && !_tracerouteOpen && !MeshService::getInstance().findNode(_selectedNodeNum)) {
+        _modalOpen = false;
+        UIEngine::getInstance().requestFullRefresh();
+        return;
+    }
     // While the traceroute panel is open, repaint when a new result lands or after a retry timeout
     if (!_tracerouteOpen) return;
     const auto& tr = MeshService::getInstance().getLastTraceroute();
@@ -50,20 +58,21 @@ bool ViewNodes::scrollPage(int8_t direction) {
 }
 
 // Draws a string clipped to maxW px at the current text size, with "..." when it does not fit:
-// long names (31 chars) would run over the PKI padlock and the card edge.
+// long names (31 chars) would run over the PKI padlock and the card edge. The text is sanitized
+// first (network names can carry control bytes and broken UTF-8, see sanitizeDisplayText).
 static void drawStringEllipsized(M5GFX& gfx, const char* text, int x, int y, int maxW) {
-    if (gfx.textWidth(text) <= maxW) {
-        gfx.drawString(text, x, y);
+    char clean[128];
+    sanitizeDisplayText(text, clean, sizeof(clean));
+    if (gfx.textWidth(clean) <= maxW) {
+        gfx.drawString(clean, x, y);
         return;
     }
-    char buf[96];
-    snprintf(buf, sizeof(buf), "%s", text);
-    size_t len = strlen(buf);
+    size_t len = strlen(clean);
     const int dotsW = gfx.textWidth("...");
-    while (len > 0 && gfx.textWidth(buf) + dotsW > maxW) buf[--len] = '\0';
-    while (len > 0 && buf[len - 1] == ' ') buf[--len] = '\0';
-    snprintf(buf + len, sizeof(buf) - len, "...");
-    gfx.drawString(buf, x, y);
+    while (len > 0 && gfx.textWidth(clean) + dotsW > maxW) clean[--len] = '\0';
+    while (len > 0 && clean[len - 1] == ' ') clean[--len] = '\0';
+    snprintf(clean + len, sizeof(clean) - len, "...");
+    gfx.drawString(clean, x, y);
 }
 
 // Meshtastic Config.DeviceConfig.Role -> compact card label. Unknown codes keep the raw number:
@@ -122,11 +131,12 @@ void ViewNodes::drawTraceroutePanel(M5GFX& gfx) {
 
     const char* txt = (tr.text[0] != '\0') ? tr.text : (tr.pending ? "Traceroute in progress..." : "No results");
     // Simple word wrap at 34 chars per line, max 8 lines: the MAC/env block starts at y=416 and a
-    // 9th line would land on top of it.
+    // 9th line would land on top of it. The result text carries node names, so sanitize it first.
     int line = 0;
     int lineY = 190;
     char buf[200];
-    snprintf(buf, sizeof(buf), "%s", txt);
+    sanitizeDisplayText(txt, buf, sizeof(buf));
+    if (buf[0] == '\0') snprintf(buf, sizeof(buf), "%s", tr.pending ? "Traceroute in progress..." : "No results");
     char* p = buf;
     while (*p && line < 8) {
         char out[40];
@@ -251,14 +261,19 @@ void ViewNodes::draw(M5GFX& gfx) {
         gfx.drawRoundRect(14, cardY, 452, 80, 6, TFT_BLACK);
         gfx.fillRoundRect(16, cardY + 2, 448, 76, 4, TFT_WHITE);
 
-        // Short Name badge (pure black on white with bold border for maximum contrast)
+        // Short Name badge (pure black on white with bold border for maximum contrast). The name
+        // comes from the peer: sanitize it and clip it to the badge, or a longer-than-4 name would
+        // run over the long name and the card border.
         gfx.fillRoundRect(22, cardY + 8, 70, 64, 4, TFT_WHITE);
         gfx.drawRoundRect(22, cardY + 8, 70, 64, 4, TFT_BLACK);
         gfx.drawRoundRect(23, cardY + 9, 68, 62, 3, TFT_BLACK);
         gfx.setTextColor(TFT_BLACK, TFT_WHITE);
         gfx.setTextDatum(textdatum_t::middle_center);
         gfx.setTextSize(2);
-        gfx.drawString(node.shortName, 57, cardY + 40);
+        char badge[10];
+        sanitizeDisplayText(node.shortName, badge, sizeof(badge));
+        if (badge[0] == '\0') snprintf(badge, sizeof(badge), "--");
+        drawStringEllipsized(gfx, badge, 57, cardY + 40, 62);
 
         // Long Name (ellipsized: must stop before the PKI padlock at x=426)
         gfx.setTextColor(TFT_BLACK, TFT_WHITE);
@@ -316,7 +331,9 @@ void ViewNodes::draw(M5GFX& gfx) {
             gfx.setTextDatum(textdatum_t::middle_center);
             gfx.setTextSize(2);
             char modalTitle[48];
-            snprintf(modalTitle, sizeof(modalTitle), "Node: %s (%s)", sel->shortName, sel->idStr);
+            char shortClean[12];
+            sanitizeDisplayText(sel->shortName, shortClean, sizeof(shortClean));
+            snprintf(modalTitle, sizeof(modalTitle), "Node: %s (%s)", shortClean[0] ? shortClean : "?", sel->idStr);
             gfx.drawString(modalTitle, 240, 202);
 
             // Button 1: Send DM (Y: 240..290)
