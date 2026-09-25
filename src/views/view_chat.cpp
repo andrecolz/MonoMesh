@@ -424,21 +424,30 @@ void ViewChat::drawConversationList(M5GFX& gfx) {
             gfx.setTextDatum(textdatum_t::middle_left);
         }
 
-        // Top-bar style unread badge [N]
+        // Top-bar style unread badge [N]: width follows the text (+ padding), right-aligned so a
+        // 2-3 digit count can never spill out of the box or touch the timestamp. A crowded row
+        // (long channel label) collapses the count to 9+ / 99+ instead of squeezing the timestamp.
         int timeX = 452;
         if (it.unread > 0) {
-            int bw = 46;
-            int bh = 26;
-            int bx = 410;
-            int by = y + (cardH - bh) / 2;
+            char bStr[8];
+            if (it.unread > 99) snprintf(bStr, sizeof(bStr), "99+");
+            else snprintf(bStr, sizeof(bStr), "[%u]", (unsigned)it.unread);
+            gfx.setTextSize(2);
+            int bw = gfx.textWidth(bStr) + 12;
+            const int timeW = (it.timeStr[0] != '\0') ? gfx.textWidth(it.timeStr) : 0;
+            const int labelEnd = 26 + gfx.textWidth(label);
+            if (it.unread > 9 && labelEnd + 8 + timeW + 8 + bw > 456) {
+                snprintf(bStr, sizeof(bStr), "9+");
+                bw = gfx.textWidth(bStr) + 12;
+            }
+            const int bh = 26;
+            const int bx = 456 - bw;
+            const int by = y + (cardH - bh) / 2;
             gfx.fillRoundRect(bx, by, bw, bh, 4, TFT_BLACK);
             gfx.setTextColor(TFT_WHITE, TFT_BLACK);
             gfx.setTextDatum(textdatum_t::middle_center);
-            gfx.setTextSize(2);
-            char bStr[8];
-            snprintf(bStr, sizeof(bStr), "[%u]", (unsigned)it.unread);
             gfx.drawString(bStr, bx + bw / 2, by + bh / 2);
-            timeX = 402;
+            timeX = bx - 8;
         }
 
         // Timestamp / Relative elapsed time on the right

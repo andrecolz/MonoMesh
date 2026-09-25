@@ -6,6 +6,7 @@
 #include "storage_manager.h"
 #include <esp_log.h>
 #include <esp_sleep.h>
+#include <esp_timer.h>
 #include <driver/gpio.h>
 #include <driver/rtc_io.h>
 
@@ -189,7 +190,12 @@ bool BSP::init(uint8_t initialBrightness) {
     // ever cleared it, so it stayed lit until the first standby cycle.
     setLed(false, 0, 0);
 
-    return true;
+    if (!_pm1Ready) {
+        // Without the PMIC the power button, battery gauge and RTC are all dead: report it instead
+        // of pretending the board initialised (main() logs and degrades gracefully).
+        ESP_LOGE(TAG, "PM1 not responding: power button/battery/RTC unavailable");
+    }
+    return _pm1Ready;
 }
 
 void BSP::setFrontlight(uint8_t brightnessPercent) {
@@ -333,14 +339,15 @@ void BSP::addRtcSeconds(int32_t deltaSeconds) {
 
 bool BSP::checkPowerButton() {
     if (!_pm1Ready) return false;
-    if (millis() < 2500) {
-        // Ignore bootup / power-on transient and clear state
+    if (esp_timer_get_time() < 2500000LL) {
+        // Ignore bootup / power-on transient and clear state (timer-based: a millis() < 2500 test
+        // re-armed itself for 2.5 s every time millis() wrapped, ~49 days in).
         M5.BtnPWR.wasClicked();
         return false;
     }
 
-    if (millis() < _wakeCooldownUntil) {
-        // Drain any lingering power button events from waking up
+    if ((int32_t)(millis() - _wakeCooldownUntil) < 0) {
+        // Drain any lingering power button events from waking up (wrap-safe deadline check)
         M5.BtnPWR.wasClicked();
         M5.BtnPWR.wasHold();
         bool flag = false;
@@ -472,8 +479,11 @@ void BSP::shutdownHardware() {
     if (esp_sleep_enable_ext0_wakeup(pm1Irq, 0) != ESP_OK) {
         ESP_LOGW(TAG, "EXT0 wake on PM1 IRQ failed, relying on the timer wake");
     }
-    esp_sleep_enable_timer_wakeup(60ULL * 1000000ULL);
-    ESP_LOGW(TAG, "Deep sleep fallback: wake on PM1 IRQ (GPIO %d, low) or 60s timer", Pins::PM1_IRQ);
+    // Safety-net timer only: with a low cell the 60 s fallback produced a "wake, boot, sample,
+    // power-off" cycle of ~80 s of activity every minute, draining the battery to zero. The power
+    // button (EXT0) is the real wake source; the timer just guarantees the device comes back.
+    esp_sleep_enable_timer_wakeup(600ULL * 1000000ULL);
+    ESP_LOGW(TAG, "Deep sleep fallback: wake on PM1 IRQ (GPIO %d, low) or 10 min timer", Pins::PM1_IRQ);
     esp_deep_sleep_start();
 }
 
@@ -873,11 +883,13 @@ void BSP::disarmRtcAlarm() {
 
 void BSP::update() {
     uint32_t now = millis();
-    if (_buzzerActive && now >= _buzzerOffUntil) {
+    // Signed differences: "now >= deadline" misbehaves across the millis() wrap (~49 days of
+    // uptime) - the buzzer/LED would fire early or stay stuck until the next wrap.
+    if (_buzzerActive && (int32_t)(now - _buzzerOffUntil) >= 0) {
         _buzzerActive = false;
         ledcWrite(0, 0);
     }
-    if (_ledOffUntil > 0 && now >= _ledOffUntil) {
+    if (_ledOffUntil > 0 && (int32_t)(now - _ledOffUntil) >= 0) {
         _ledOffUntil = 0;
         setLed(false, 0, 0);
     }

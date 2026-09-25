@@ -219,18 +219,21 @@ bool ViewAlarm::resetToRoot() {
 // ---------------------------------------------------------------- navigation
 void ViewAlarm::openEditor(int index) {
     AlarmService& svc = AlarmService::getInstance();
+    AlarmRecord a = {};
     if (index < 0) {
-        AlarmRecord a = {};
-        defaultAlarm(a);
-        index = svc.addAlarm(a);
-        if (index < 0) {
+        // "+": draft only. The alarm enters the service (and gets persisted) on the first real
+        // change in applyEdit(), so backing out of the untouched editor leaves no armed alarm.
+        if (svc.alarms().size() >= MAX_ALARMS) {
             ESP_LOGW(TAG, "Alarm list full (%u): not adding", (unsigned)MAX_ALARMS);
             BSP::getInstance().click();
             return;
         }
+        defaultAlarm(a);
+    } else {
+        a = svc.alarms()[(size_t)index];
     }
     _editIndex = index;
-    _draft = svc.alarms()[(size_t)index];
+    _draft = a;
     _page = Page::Edit;
     _modal = Modal::None;
     UIEngine::getInstance().requestFullRefresh();
@@ -249,9 +252,18 @@ void ViewAlarm::closeEditor() {
 }
 
 void ViewAlarm::applyEdit() {
-    if (_editIndex < 0) return;
-    AlarmService::getInstance().updateAlarm((size_t)_editIndex, _draft);
-    _draft = AlarmService::getInstance().alarms()[(size_t)_editIndex]; // sanitized copy
+    AlarmService& svc = AlarmService::getInstance();
+    if (_editIndex < 0) {
+        // First change on a "+"/new alarm: this is the user confirming it, only now it is added
+        // (addAlarm also persists). A never-touched draft simply evaporates on closeEditor().
+        _editIndex = svc.addAlarm(_draft);
+        if (_editIndex < 0) return; // list full: the draft stays on screen unsaved
+        _draft = svc.alarms()[(size_t)_editIndex]; // sanitized copy
+        markSavePending();
+        return;
+    }
+    svc.updateAlarm((size_t)_editIndex, _draft);
+    _draft = svc.alarms()[(size_t)_editIndex]; // sanitized copy
     markSavePending();
 }
 
@@ -427,7 +439,30 @@ bool ViewAlarm::handleTouch(const TouchEvent& ev) {
 }
 
 bool ViewAlarm::handleListTouch(const TouchEvent& ev) {
-    if (ev.type != TouchEventType::Click) return false;
+    // Same paging gestures as the chat/node lists: swipe pages, Click or Up opens.
+    // Swipe Up -> Next page
+    if (ev.type == TouchEventType::SwipeUp) {
+        const size_t count = AlarmService::getInstance().alarms().size();
+        int totalPages = (int)((count + LIST_PAGE_SIZE - 1) / LIST_PAGE_SIZE);
+        if (totalPages < 1) totalPages = 1;
+        if (_listPage < totalPages) {
+            _listPage++;
+            UIEngine::getInstance().requestFullRefresh();
+        }
+        return true;
+    }
+
+    // Swipe Down -> Previous page
+    if (ev.type == TouchEventType::SwipeDown) {
+        if (_listPage > 1) {
+            _listPage--;
+            UIEngine::getInstance().requestFullRefresh();
+        }
+        return true;
+    }
+
+    // Click or Up: a tap with drift / longer than 1s arrives as Up (TouchManager) and must work too
+    if (ev.type != TouchEventType::Click && ev.type != TouchEventType::Up) return false;
 
     // Floating + (square hit box a little larger than the circle).
     if (ev.x >= FAB_CX - FAB_R - 6 && ev.x <= FAB_CX + FAB_R + 6 &&
@@ -516,7 +551,11 @@ bool ViewAlarm::handleEditorTouch(const TouchEvent& ev) {
                 for (int d = 0; d < 7; ++d) {
                     const int by = r.y + (r.h - DAY_BTN_H) / 2;
                     if (!inRect(ev, dayButtonX(d), by, DAY_BTN_W, DAY_BTN_H)) continue;
-                    _draft.daysMask ^= (uint8_t)(1u << d);
+                    // Keep at least one active day: daysMask == 0 would save a WEEKLY alarm that
+                    // alarmMatches() can never fire (same rationale as the WEEKLY preselection).
+                    const uint8_t bit = (uint8_t)(1u << d);
+                    if ((_draft.daysMask & bit) && _draft.daysMask == bit) return true;
+                    _draft.daysMask ^= bit;
                     applyEdit();
                     drawEditor(M5.Display);
                     EPDDriver::getInstance().flushRect(CONTENT_X, r.y, CONTENT_W, r.h);

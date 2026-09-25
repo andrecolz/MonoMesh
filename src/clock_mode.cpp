@@ -99,6 +99,10 @@ void ClockMode::drawTime(M5GFX& gfx, const Layout& l, int hour, int minute, bool
                          bool hourChanged, bool minuteChanged) {
     const Face& f = l.face;
     const int top = l.baseline - f.digitHeight;
+    // Defensive clamp: a degraded RTC can report out-of-range fields and f.digits[] only has 10
+    // glyphs (hour = 100 would index past the array).
+    if (hour < 0 || hour > 23) hour = 0;
+    if (minute < 0 || minute > 59) minute = 0;
 
     if (!valid) {
         // No RTC time yet: show --:-- instead of a fake 00:00 (same policy as the chat timestamps).
@@ -126,8 +130,11 @@ void ClockMode::drawTime(M5GFX& gfx, const Layout& l, int hour, int minute, bool
     // new digit can be narrower than the old one and the ink that dips below the baseline must go,
     // otherwise the differential refresh would keep the previous ink around it.
     if (hourChanged) {
+        // The colon is repainted together with the hours (it sits right after the hour cells): widen
+        // the erase to cover it too, and see refreshRegion() for the matching flush width.
         gfx.fillRect(l.x0 - CLOCK_MARGIN, top - CLOCK_MARGIN,
-                     2 * f.digitAdvance + 2 * CLOCK_MARGIN, f.digitHeight + 2 * CLOCK_MARGIN, TFT_WHITE);
+                     2 * f.digitAdvance + f.colonAdvance + 2 * CLOCK_MARGIN,
+                     f.digitHeight + 2 * CLOCK_MARGIN, TFT_WHITE);
         blitGlyph(gfx, l.x0, l.baseline, f.digits[hour / 10]);
         blitGlyph(gfx, l.x0 + f.digitAdvance, l.baseline, f.digits[hour % 10]);
         blitGlyph(gfx, colonX, l.baseline, *f.colon);
@@ -145,7 +152,9 @@ void ClockMode::refreshRegion(const Layout& l, bool hourChanged, bool minuteChan
     int left = 0, right = -1;
     if (hourChanged) {
         left = l.x0;
-        right = l.x0 + 2 * f.digitAdvance - 1;
+        // Include the colon slot: drawTime() repaints it with the hours and the erase above reaches
+        // into it, so flushing up to the hour cells left that strip stale on the panel.
+        right = l.x0 + 2 * f.digitAdvance + f.colonAdvance - 1;
     }
     if (minuteChanged) {
         const int mx = l.x0 + 2 * f.digitAdvance + f.colonAdvance;

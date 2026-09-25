@@ -126,7 +126,10 @@ public:
     // sleep (timer + buttons): used by the clock modes so a short tap is not lost between the
     // minute-aligned slices. DIO1 is never armed this way.
     static constexpr uint32_t STANDBY_SLEEP_MS = 100;
-    static constexpr uint32_t CLOCK_SLEEP_MS = 1000;
+    // Cap of ClockMode::msToNextMinute(): the clock face only shows HH:MM, so the mode sleeps all the
+    // way to the next minute boundary (the old 1 s cap meant 60 wake-ups per minute, each one paying
+    // a full I2C poll round for nothing).
+    static constexpr uint32_t CLOCK_SLEEP_MS = 60000;
     esp_sleep_wakeup_cause_t lowPowerLightSleep(uint32_t maxSleepMs, bool buttonWake = false);
     // True while a notification beep or an LED activity pulse is still running: light sleep does not
     // stop the LEDC timer, so without this the beep/LED outlived its configured duration.

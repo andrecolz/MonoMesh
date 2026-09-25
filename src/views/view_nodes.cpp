@@ -49,6 +49,44 @@ bool ViewNodes::scrollPage(int8_t direction) {
     return true;
 }
 
+// Draws a string clipped to maxW px at the current text size, with "..." when it does not fit:
+// long names (31 chars) would run over the PKI padlock and the card edge.
+static void drawStringEllipsized(M5GFX& gfx, const char* text, int x, int y, int maxW) {
+    if (gfx.textWidth(text) <= maxW) {
+        gfx.drawString(text, x, y);
+        return;
+    }
+    char buf[96];
+    snprintf(buf, sizeof(buf), "%s", text);
+    size_t len = strlen(buf);
+    const int dotsW = gfx.textWidth("...");
+    while (len > 0 && gfx.textWidth(buf) + dotsW > maxW) buf[--len] = '\0';
+    while (len > 0 && buf[len - 1] == ' ') buf[--len] = '\0';
+    snprintf(buf + len, sizeof(buf) - len, "...");
+    gfx.drawString(buf, x, y);
+}
+
+// Meshtastic Config.DeviceConfig.Role -> compact card label. Unknown codes keep the raw number:
+// a "CLIENT" fallback would silently hide roles this firmware does not know yet.
+static void roleLabel(uint8_t role, char* out, size_t cap) {
+    const char* txt = nullptr;
+    switch (role) {
+        case 0: txt = "CLIENT"; break;
+        case 1: txt = "MUTE"; break;
+        case 2: txt = "ROUTER"; break;
+        case 3: txt = "RTR-CLI"; break;
+        case 4: txt = "REPEATER"; break;
+        case 5: txt = "TRACKER"; break;
+        case 6: txt = "SENSOR"; break;
+        case 7: txt = "TAK"; break;
+        case 8: txt = "CLT-HIDDEN"; break;
+        case 9: txt = "LOST/FOUND"; break;
+        case 10: txt = "TAK-TRK"; break;
+    }
+    if (txt) snprintf(out, cap, "%s", txt);
+    else snprintf(out, cap, "ROLE%u", (unsigned)role);
+}
+
 // Small padlock glyph: closed = key known / authenticated, open = no public key exchanged yet
 void ViewNodes::drawPadlock(M5GFX& gfx, int x, int y, bool locked) {
     // Shackle
@@ -83,13 +121,14 @@ void ViewNodes::drawTraceroutePanel(M5GFX& gfx) {
     gfx.setTextSize(2);
 
     const char* txt = (tr.text[0] != '\0') ? tr.text : (tr.pending ? "Traceroute in progress..." : "No results");
-    // Simple word wrap at 34 chars per line, max 9 lines
+    // Simple word wrap at 34 chars per line, max 8 lines: the MAC/env block starts at y=416 and a
+    // 9th line would land on top of it.
     int line = 0;
     int lineY = 190;
     char buf[200];
     snprintf(buf, sizeof(buf), "%s", txt);
     char* p = buf;
-    while (*p && line < 9) {
+    while (*p && line < 8) {
         char out[40];
         size_t take = 0;
         while (take < 34 && p[take] != '\0') take++;
@@ -129,7 +168,7 @@ void ViewNodes::drawTraceroutePanel(M5GFX& gfx) {
         } else {
             snprintf(l1, sizeof(l1), "MAC: -- | Bat %u%% %.2fV", (unsigned)infoNode->battery, infoNode->voltage);
         }
-        gfx.drawString(l1, 36, 416);
+        drawStringEllipsized(gfx, l1, 36, 416, 400);
 
         char l2[80];
         if (infoNode->hasEnvMetrics) {
@@ -143,27 +182,28 @@ void ViewNodes::drawTraceroutePanel(M5GFX& gfx) {
         } else {
             snprintf(l2, sizeof(l2), "Environment: no telemetry data");
         }
-        gfx.drawString(l2, 36, 432);
+        drawStringEllipsized(gfx, l2, 36, 432, 400);
 
         if (infoNode->statusText[0] != '\0') {
             char l3[64];
             snprintf(l3, sizeof(l3), "Status: %.44s", infoNode->statusText);
-            gfx.drawString(l3, 36, 466);
+            drawStringEllipsized(gfx, l3, 36, 466, 400);
         }
     }
 
-    // Re-run button
+    // Re-run button: same CANCEL/CONFIRM convention as the settings modals (CONFIRM = primary)
     gfx.drawRoundRect(40, 490, 180, 54, 6, TFT_BLACK);
-    gfx.fillRoundRect(42, 492, 176, 50, 5, TFT_WHITE);
+    gfx.fillRoundRect(42, 492, 176, 50, 5, TFT_BLACK);
     gfx.setTextSize(2);
     gfx.setTextDatum(textdatum_t::middle_center);
-    gfx.drawString("Repeat", 130, 517);
+    gfx.setTextColor(TFT_WHITE, TFT_BLACK);
+    gfx.drawString("CONFIRM", 130, 517);
 
     // Close button
     gfx.drawRoundRect(260, 490, 180, 54, 6, TFT_BLACK);
     gfx.fillRoundRect(262, 492, 176, 50, 5, TFT_LIGHTGRAY);
     gfx.setTextColor(TFT_BLACK, TFT_LIGHTGRAY);
-    gfx.drawString("Close", 350, 517);
+    gfx.drawString("CANCEL", 350, 517);
 }
 
 void ViewNodes::draw(M5GFX& gfx) {
@@ -220,34 +260,36 @@ void ViewNodes::draw(M5GFX& gfx) {
         gfx.setTextSize(2);
         gfx.drawString(node.shortName, 57, cardY + 40);
 
-        // Long Name
+        // Long Name (ellipsized: must stop before the PKI padlock at x=426)
         gfx.setTextColor(TFT_BLACK, TFT_WHITE);
         gfx.setTextDatum(textdatum_t::top_left);
         gfx.setTextSize(2);
-        gfx.drawString(node.longName, 100, cardY + 12);
+        drawStringEllipsized(gfx, node.longName, 100, cardY + 12, 314);
 
-        // Details line: ID, SNR, hop distance, battery
+        // Details line: ID, SNR, hop distance, battery (+ coordinates when known)
         gfx.setTextSize(1);
         char details[96];
-        const char* roleTxt = (node.role == 2) ? "ROUTER" : (node.role == 1 ? "MUTE" : "CLIENT");
+        char roleTxt[12];
+        roleLabel(node.role, roleTxt, sizeof(roleTxt));
         char batTxt[16];
         if (node.battery > 0) snprintf(batTxt, sizeof(batTxt), "%u%%", (unsigned)node.battery);
         else snprintf(batTxt, sizeof(batTxt), "--");
         if (node.hasPosition) {
-            snprintf(details, sizeof(details), "ID: %s | %.1fdB | %uhop | Bat %s", node.idStr, node.snr,
-                     (unsigned)node.hopsAway, batTxt);
+            // Shorter labels here: with the coordinates the line must still stop before the padlock
+            snprintf(details, sizeof(details), "%s | %.1fdB | %uh | %s | %.4f,%.4f", node.idStr, node.snr,
+                     (unsigned)node.hopsAway, batTxt, node.lat, node.lon);
         } else {
             snprintf(details, sizeof(details), "ID: %s | %.1fdB | %uhop | Bat %s", node.idStr, node.snr,
                      (unsigned)node.hopsAway, batTxt);
         }
-        gfx.drawString(details, 100, cardY + 42);
+        drawStringEllipsized(gfx, details, 100, cardY + 42, 314);
 
         // Role + Last Heard
         char ageTxt[20];
         MeshService::formatAgeLabel(MeshService::getInstance().getNodeAgeSeconds(node), ageTxt, sizeof(ageTxt));
         char status[48];
         snprintf(status, sizeof(status), "%s | %s", roleTxt, ageTxt);
-        gfx.drawString(status, 100, cardY + 58);
+        drawStringEllipsized(gfx, status, 100, cardY + 58, 314);
 
         // PKI padlock: closed when we hold a verified/known public key for this node
         drawPadlock(gfx, 426, cardY + 44, node.hasPublicKey);
@@ -303,11 +345,11 @@ void ViewNodes::draw(M5GFX& gfx) {
             gfx.fillRoundRect(52, 382, 376, 46, 4, TFT_WHITE);
             gfx.drawString("Node details / Traceroute", 240, 405);
 
-            // Button 4: Close (Y: 460..510)
+            // Button 4: CANCEL (Y: 460..510)
             gfx.drawRoundRect(50, 460, 380, 50, 6, TFT_BLACK);
             gfx.fillRoundRect(52, 462, 376, 46, 4, TFT_LIGHTGRAY);
             gfx.setTextColor(TFT_BLACK, TFT_LIGHTGRAY);
-            gfx.drawString("Close", 240, 485);
+            gfx.drawString("CANCEL", 240, 485);
         }
     }
 }
@@ -331,7 +373,7 @@ static void sendNodeDm(uint32_t nodeNum, const std::string& text) {
 bool ViewNodes::handleTouch(const TouchEvent& ev) {
     if (_tracerouteOpen) {
         if (ev.type != TouchEventType::Click && ev.type != TouchEventType::Up) return true;
-        // "Ripeti"
+        // "CONFIRM": re-run the traceroute
         if (ev.x >= 40 && ev.x <= 220 && ev.y >= 490 && ev.y <= 544) {
             if (_selectedNodeNum != 0) {
                 MeshService::getInstance().sendTraceroute(_selectedNodeNum);
@@ -340,7 +382,7 @@ bool ViewNodes::handleTouch(const TouchEvent& ev) {
             }
             return true;
         }
-        // "Chiudi"
+        // "CANCEL": close the panel
         if (ev.x >= 260 && ev.x <= 440 && ev.y >= 490 && ev.y <= 544) {
             _tracerouteOpen = false;
             _modalOpen = false;
@@ -386,7 +428,7 @@ bool ViewNodes::handleTouch(const TouchEvent& ev) {
             return true;
         }
 
-        // Modal Button 4: Close (Y: 460..510)
+        // Modal Button 4: CANCEL (Y: 460..510)
         if (ev.x >= 50 && ev.x <= 430 && ev.y >= 460 && ev.y <= 510) {
             _modalOpen = false;
             UIEngine::getInstance().requestFullRefresh();

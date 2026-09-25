@@ -625,7 +625,9 @@ def cache_read(path):
         if f.read(len(CACHE_MAGIC)) != CACHE_MAGIC:
             raise ValueError("not a MonoMesh binary cache")
         version, _flags = struct.unpack("<II", f.read(8))
-        if version not in (1, CACHE_VERSION):
+        # v1 = senza place_population, v2 = con place_population, v3 = come la v2
+        # (il bump serve solo a invalidare le cache estratte con l'acqua sbagliata)
+        if version not in (1, 2, CACHE_VERSION):
             raise ValueError(f"unsupported cache version {version}")
         bbox = struct.unpack("<4d", f.read(32))
         n_ways, n_places, blob_len = struct.unpack("<III", f.read(12))
@@ -2268,7 +2270,11 @@ def generate_tiles_from_pbf(pbf_path, min_lat, min_lon, max_lat, max_lon, zoom_l
     if not pending:
         if verbose:
             print("[✓] Nothing to render.")
-        return {"rendered": 0, "skipped": skipped, "bytes": 0, "seconds": 0.0}
+        # Same keys as the normal return: callers unpack them unconditionally.
+        return {"rendered": 0, "skipped": skipped, "bytes": 0, "seconds": 0.0,
+                "pipeline_seconds": time.time() - t_pipeline, "jobs": jobs,
+                "mmap": None, "stats": {}, "extract_seconds": extract_time,
+                "index_seconds": 0.0}
 
     total_count = sum(len(tiles) for tiles in pending.values())
     if verbose:
@@ -2527,6 +2533,18 @@ def generate_tiles_from_pbf(pbf_path, min_lat, min_lon, max_lat, max_lon, zoom_l
 # --------------------------------------------------------------------------- #
 # Interactive TUI
 # --------------------------------------------------------------------------- #
+def _ask_float(prompt, default=None):
+    """Asks until a valid number arrives: a typo must not kill the TUI."""
+    while True:
+        raw = input(prompt).strip()
+        if not raw and default is not None:
+            return default
+        try:
+            return float(raw)
+        except ValueError:
+            print("[!] Please enter a number (e.g. 45.8081).")
+
+
 def run_tui():
     header = (
         "[bold cyan]===========================================================[/bold cyan]\n"
@@ -2552,8 +2570,16 @@ def run_tui():
         print("\nPBF files found:")
         for idx, p in enumerate(pbf_candidates, 1):
             print(f"  [{idx}] {os.path.basename(p)} ({os.path.getsize(p)/(1024*1024):.0f} MB)")
-        sel = input("Choose the PBF file [default: 1]: ").strip() or "1"
-        pbf_path = pbf_candidates[int(sel) - 1]
+        sel = 0
+        while not 1 <= sel <= len(pbf_candidates):
+            raw = input("Choose the PBF file [default: 1]: ").strip() or "1"
+            try:
+                sel = int(raw)
+            except ValueError:
+                sel = 0
+            if not 1 <= sel <= len(pbf_candidates):
+                print(f"[!] Enter a number between 1 and {len(pbf_candidates)}.")
+        pbf_path = pbf_candidates[sel - 1]
 
     if not os.path.exists(pbf_path):
         print(f"[!] File {pbf_path} does not exist!")
@@ -2588,8 +2614,7 @@ def run_tui():
         res = geocode_city(city_name)
         if res:
             print(f"[✓] Found: {res['name']} ({res['lat']:.4f}, {res['lon']:.4f})")
-            r_str = input("Radius in km to cover [default: 4.0]: ").strip() or "4.0"
-            r_km = float(r_str)
+            r_km = _ask_float("Radius in km to cover [default: 4.0]: ", 4.0)
             dlat = r_km / 111.0
             dlon = r_km / (111.0 * math.cos(math.radians(res["lat"])))
             min_lat, max_lat = res["lat"] - dlat, res["lat"] + dlat
@@ -2600,9 +2625,9 @@ def run_tui():
             min_lat, max_lat, min_lon, max_lon = 45.77, 45.85, 9.04, 9.13
             area_name = "como"
     elif choice == "2":
-        lat = float(input("Latitude (e.g. 45.8081): ").strip() or "45.8081")
-        lon = float(input("Longitude (e.g. 9.0852): ").strip() or "9.0852")
-        r_km = float(input("Radius in km [default: 4.0]: ").strip() or "4.0")
+        lat = _ask_float("Latitude (e.g. 45.8081): ", 45.8081)
+        lon = _ask_float("Longitude (e.g. 9.0852): ", 9.0852)
+        r_km = _ask_float("Radius in km [default: 4.0]: ", 4.0)
         dlat = r_km / 111.0
         dlon = r_km / (111.0 * math.cos(math.radians(lat)))
         min_lat, max_lat = lat - dlat, lat + dlat
@@ -2613,10 +2638,10 @@ def run_tui():
         # min_lat, max_lat, min_lon, max_lon, which is an easy way to ask for a
         # continent by accident.
         print("Bounding box in decimal degrees:")
-        min_lat = float(input("  Minimum latitude (South): ").strip())
-        max_lat = float(input("  Maximum latitude (North): ").strip())
-        min_lon = float(input("  Minimum longitude (West): ").strip())
-        max_lon = float(input("  Maximum longitude (East): ").strip())
+        min_lat = _ask_float("  Minimum latitude (South): ")
+        max_lat = _ask_float("  Maximum latitude (North): ")
+        min_lon = _ask_float("  Minimum longitude (West): ")
+        max_lon = _ask_float("  Maximum longitude (East): ")
         area_name = f"bbox_{min_lat:.2f}_{min_lon:.2f}"
 
     if not (min_lat < max_lat and min_lon < max_lon) or \
@@ -2633,8 +2658,15 @@ def run_tui():
     print("  - Z13: City and main roads (~10-25 tiles, RECOMMENDED)")
     print("  - Z14: Street and hamlet detail (~30-60 tiles, RECOMMENDED)")
     print("  - Z15: Block-level detail (~80+ tiles)")
-    z_str = input("Enter zoom levels separated by commas [default: 12,13,14]: ").strip() or "12,13,14"
-    zooms = [int(z.strip()) for z in z_str.split(",") if z.strip()]
+    zooms = []
+    while not zooms:
+        z_str = input("Enter zoom levels separated by commas [default: 12,13,14]: ").strip() or "12,13,14"
+        try:
+            zooms = [int(z.strip()) for z in z_str.split(",") if z.strip()]
+        except ValueError:
+            zooms = []
+        if not zooms:
+            print("[!] Enter comma separated zoom levels (e.g. 12,13,14).")
 
     # 4. Style
     print("\nToner Style:")

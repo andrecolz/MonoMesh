@@ -49,6 +49,7 @@ static bool pkiDeriveKey(const uint8_t* peerPubKey, const uint8_t* myPrivKey, ui
     if (!peerPubKey || !myPrivKey || !outKey) return false;
     uint8_t sharedSecret[crypto_scalarmult_curve25519_BYTES] = {0};
     if (crypto_scalarmult_curve25519(sharedSecret, myPrivKey, peerPubKey) != 0) {
+        sodium_memzero(sharedSecret, sizeof(sharedSecret));
         return false;
     }
     mbedtls_sha256_context sha;
@@ -57,6 +58,8 @@ static bool pkiDeriveKey(const uint8_t* peerPubKey, const uint8_t* myPrivKey, ui
     mbedtls_sha256_update(&sha, sharedSecret, sizeof(sharedSecret));
     mbedtls_sha256_finish(&sha, outKey);
     mbedtls_sha256_free(&sha);
+    // The ECDH secret is the KDF input: do not leave it sitting in the stack frame.
+    sodium_memzero(sharedSecret, sizeof(sharedSecret));
     return true;
 }
 
@@ -312,7 +315,11 @@ static uint32_t pbDataRequestId(const uint8_t* data, size_t len) {
             uint64_t subLen = 0;
             size_t n2 = pbReadVarint(data + offset, len - offset, subLen);
             if (n2 == 0) break;
-            offset += n2 + (size_t)subLen;
+            offset += n2;
+            // subLen is attacker-controlled: compare before adding, a huge varint would wrap the
+            // sum and let the loop skip "backwards" out of the buffer.
+            if (subLen > len - offset) break;
+            offset += (size_t)subLen;
         } else {
             break;
         }
@@ -436,7 +443,9 @@ bool MeshService::init() {
         // Primary channel (Ch 0) configuration
         memset(_primaryChannelName, 0, sizeof(_primaryChannelName));
         strncpy(_primaryChannelName, cfg.primaryChannelName, sizeof(_primaryChannelName) - 1);
-        _primaryPskLen = (cfg.primaryPskLen > 32) ? 16 : cfg.primaryPskLen;
+        // Only 0/16/32 are legal Meshtastic PSK lengths (0 = no key): a corrupt blob must not feed a
+        // 24- or 1-byte "key" to the hash/AES paths (setPrimaryChannelPsk() already enforces this).
+        _primaryPskLen = (cfg.primaryPskLen == 0) ? 0 : (cfg.primaryPskLen == 32 ? 32 : 16);
         memset(_primaryPsk, 0, sizeof(_primaryPsk));
         if (_primaryPskLen > 0) memcpy(_primaryPsk, cfg.primaryPsk, _primaryPskLen);
         _positionIntervalSec = cfg.positionIntervalSec;
@@ -744,12 +753,25 @@ void MeshService::processAckQueue() {
 void MeshService::processRelayQueue() {
     // Relays are the first traffic to sacrifice when the hourly budget is exhausted.
     if (!canTransmit()) return;
+    constexpr uint32_t RELAY_MAX_AGE_MS = 5000; // a flood relay is worthless minutes later
     uint32_t now = millis();
     for (auto it = _pendingRelays.begin(); it != _pendingRelays.end(); ) {
-        if (now >= it->transmitAtMillis) {
+        if ((int32_t)(now - it->transmitAtMillis) >= 0) {
+            // Queue frozen by an exhausted duty budget: drop instead of releasing a stale burst.
+            if ((uint32_t)(now - it->queuedAtMillis) > RELAY_MAX_AGE_MS) {
+                ESP_LOGD(TAG, "Dropping stale relay 0x%08x (%u ms old)", (unsigned)it->id,
+                         (unsigned)(now - it->queuedAtMillis));
+                it = _pendingRelays.erase(it);
+                continue;
+            }
             ESP_LOGI(TAG, "Transmitting relayed packet 0x%08x (len=%u)", (unsigned)it->id, (unsigned)it->len);
-            transmitRaw(it->packet, it->len);
-            it = _pendingRelays.erase(it);
+            if (transmitRaw(it->packet, it->len)) {
+                it = _pendingRelays.erase(it);
+            } else {
+                // Radio busy (mutex held by a TX): try again shortly instead of losing the relay
+                it->transmitAtMillis = now + 200;
+                ++it;
+            }
         } else {
             ++it;
         }
@@ -835,12 +857,15 @@ bool MeshService::hasPendingRadioWork() {
     // Only the radio FIFO matters for "can I sleep now?"; queued frames are processed by the loop
     // and do not need the radio.
     if (_radioSuspended) return false;
-    if (_radioReady && _radio && _radioMutex && xSemaphoreTake(_radioMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-        bool pending = (_radio->getIrqFlags() & RADIOLIB_SX126X_IRQ_RX_DONE) != 0;
-        xSemaphoreGive(_radioMutex);
-        return pending;
+    if (!_radioReady || !_radio || !_radioMutex) return false;
+    if (xSemaphoreTake(_radioMutex, pdMS_TO_TICKS(20)) != pdTRUE) {
+        // Mutex held (a TX in flight or the radio task draining the FIFO): we cannot claim the
+        // radio is idle here, so report pending work and let the caller retry.
+        return true;
     }
-    return false;
+    bool pending = (_radio->getIrqFlags() & RADIOLIB_SX126X_IRQ_RX_DONE) != 0;
+    xSemaphoreGive(_radioMutex);
+    return pending;
 }
 
 bool MeshService::hasQueuedFrames() {
@@ -870,13 +895,16 @@ bool MeshService::suspendRadio() {
     }
     int state = _radio->sleep();
     _radio->clearIrqFlags(RADIOLIB_SX126X_IRQ_ALL);
+    if (state != RADIOLIB_ERR_NONE) {
+        // Do not mark the radio suspended when the chip refused to sleep: the CLOCK mode would then
+        // assume ~uA consumption while the chip is still in RX (and the resume path would misfire).
+        unlockRadio();
+        ESP_LOGW(TAG, "SX1262 sleep returned %d (radio may still be drawing RX current)", state);
+        return false;
+    }
     _radioSuspended = true;
     unlockRadio();
-    if (state != RADIOLIB_ERR_NONE) {
-        ESP_LOGW(TAG, "SX1262 sleep returned %d (radio may still be drawing RX current)", state);
-    } else {
-        ESP_LOGI(TAG, "SX1262 parked in sleep (CLOCK mode, rail on, ~uA class)");
-    }
+    ESP_LOGI(TAG, "SX1262 parked in sleep (CLOCK mode, rail on, ~uA class)");
     return true;
 }
 
@@ -917,9 +945,11 @@ void MeshService::queueOpaqueRelay(const uint8_t* payload, size_t len, uint32_t 
     memcpy(pr.packet, payload, len);
     pr.len = len;
     pr.id = id;
+    pr.from = ((const MeshtasticHeader*)payload)->from;
     pr.packet[12] = (uint8_t)((pr.packet[12] & 0xF8) | (hopLimit - 1));
     pr.packet[15] = (uint8_t)(_localNodeNum & 0xFF);
     pr.transmitAtMillis = millis() + cwDelayMs;
+    pr.queuedAtMillis = millis();
     _pendingRelays.push_back(pr);
     _opaqueRelays++;
     ESP_LOGI(TAG, "Queued opaque relay 0x%08x in %lu ms (hops left: %u)",
@@ -969,6 +999,17 @@ void MeshService::update() {
     // Reset activity flags after 2 seconds
     if (_rxActive && (now - _rxActivityTimer > 2000)) _rxActive = false;
     if (_txActive && (now - _txActivityTimer > 2000)) _txActive = false;
+
+    // The traceroute reply travels without want_ack and can be lost: give up after 60 s instead of
+    // leaving the UI stuck on "in progress..." forever.
+    if (_lastTraceroute.pending && (int32_t)(now - _lastTraceroute.startMillis) > 60000) {
+        _lastTraceroute.pending = false;
+        _lastTraceroute.valid = true;
+        _pendingTracerouteId = 0;
+        snprintf(_lastTraceroute.text, sizeof(_lastTraceroute.text), "Traceroute to !%08x: no reply",
+                 (unsigned)_lastTraceroute.target);
+        UIEngine::getInstance().requestFullRefresh();
+    }
 
     // Real fallback when the core-0 task could not be created (RAM): read the FIFO from the loop,
     // otherwise the node would silently never receive anything.
@@ -1121,8 +1162,8 @@ void MeshService::processPacket(uint8_t* payload, size_t len, float snr, float r
 
     MeshtasticHeader* hdr = reinterpret_cast<MeshtasticHeader*>(payload);
     // A sender of 0xFFFFFFFF is never valid on the wire (official firmware drops it as well):
-    // accepting it would create a bogus node in the NodeDB.
-    if (hdr->from == NODENUM_BROADCAST) return;
+    // accepting it would create a bogus node in the NodeDB. Same for node number 0.
+    if (hdr->from == NODENUM_BROADCAST || hdr->from == 0) return;
 
     const uint32_t to = hdr->to;
     const uint32_t from = hdr->from;
@@ -1157,7 +1198,7 @@ void MeshService::processPacket(uint8_t* payload, size_t len, float snr, float r
     bool duplicateRetransmit = false;
     if (isPacketDuplicate(from, id)) {
         for (auto it = _pendingRelays.begin(); it != _pendingRelays.end(); ) {
-            if (it->id == id) {
+            if (it->id == id && it->from == from) {
                 ESP_LOGI(TAG, "Flood suppression: packet 0x%08x retransmitted by mesh, canceling relay", (unsigned)id);
                 it = _pendingRelays.erase(it);
             } else {
@@ -1306,9 +1347,11 @@ void MeshService::processPacket(uint8_t* payload, size_t len, float snr, float r
                 memcpy(pr.packet + sizeof(MeshtasticHeader), encBuf, newPlainLen);
                 pr.len = sizeof(MeshtasticHeader) + newPlainLen;
                 pr.id = id;
+                pr.from = from;
                 pr.packet[12] = (hdr->flags & 0xF8) | newHop;
                 pr.packet[15] = (uint8_t)(_localNodeNum & 0xFF);
                 pr.transmitAtMillis = millis() + 60 + (esp_random() % 160);
+                pr.queuedAtMillis = millis();
                 _pendingRelays.push_back(pr);
                 queued = true;
                 ESP_LOGI(TAG, "Traceroute hop: appended !%08x (snr %.1f)", (unsigned)_localNodeNum, snr);
@@ -1322,19 +1365,14 @@ void MeshService::processPacket(uint8_t* payload, size_t len, float snr, float r
             memcpy(pr.packet, payload, len);
             pr.len = len;
             pr.id = id;
+            pr.from = from;
             pr.packet[12] = (hdr->flags & 0xF8) | newHop;
             pr.packet[15] = (uint8_t)(_localNodeNum & 0xFF);
             pr.transmitAtMillis = millis() + cwDelayMs;
+            pr.queuedAtMillis = millis();
             _pendingRelays.push_back(pr);
             ESP_LOGI(TAG, "Queued relay for packet 0x%08x in %lu ms (hops left: %u)", (unsigned)id, (unsigned long)cwDelayMs, newHop);
         }
-    }
-
-    // Not for us (and not broadcast): nothing left to do beyond tracking the sender
-    if (!isToUs && !isBroadcastTo) {
-        updateNode(from, "", "", snr, rssi);
-        updateNodeHops(from, hopsTaken);
-        return;
     }
 
     if (!decoded || plainLen == 0) {
@@ -1346,12 +1384,25 @@ void MeshService::processPacket(uint8_t* payload, size_t len, float snr, float r
                      (unsigned)from, (unsigned)to, (unsigned)id, (unsigned)hdr->channel,
                      (unsigned)(len - sizeof(MeshtasticHeader)), (unsigned)getChannelHash());
         }
+        if (!isToUs && !isBroadcastTo) {
+            updateNode(from, "", "", snr, rssi);
+            updateNodeHops(from, hopsTaken);
+        }
         // Opaque relay: like the official firmware, forward packets we cannot decrypt (traffic on a
         // channel we are not on) so we still act as a repeater for the rest of the mesh. The
         // payload is relayed byte-for-byte, we only decrement the hop limit and stamp relay_node.
+        // This must happen for *unicast* frames too (a PKI DM in transit is undecodable here): the
+        // old code returned early for "not for us" and silently dropped every cross-mesh DM.
         if (hopLimit > 0 && !isToUs && _nodeRole != NodeRole::ClientMute && relayAllowedFor(from)) {
             queueOpaqueRelay(payload, len, id, hopLimit, snr);
         }
+        return;
+    }
+
+    // Not for us (and not broadcast): nothing left to do beyond tracking the sender
+    if (!isToUs && !isBroadcastTo) {
+        updateNode(from, "", "", snr, rssi);
+        updateNodeHops(from, hopsTaken);
         return;
     }
 
@@ -1395,12 +1446,12 @@ void MeshService::processPacket(uint8_t* payload, size_t len, float snr, float r
 
     const bool wantAck = (hdr->flags & 0x08) != 0;
     handleDecryptedData(from, to, id, plainData, plainLen, snr, rssi, wantAck, pkiDecoded,
-                        keyUsedLen ? keyUsed : nullptr, keyUsedLen, hopsTaken);
+                        keyUsedLen ? keyUsed : nullptr, keyUsedLen, hdr->channel, hopsTaken);
 }
 
 void MeshService::handleDecryptedData(uint32_t from, uint32_t to, uint32_t id, const uint8_t* data, size_t len,
                                       float snr, float rssi, bool wantAck, bool pkiDecoded,
-                                      const uint8_t* chanKey, uint8_t chanKeyLen, uint8_t hopsTaken) {
+                                      const uint8_t* chanKey, uint8_t chanKeyLen, uint8_t chanHash, uint8_t hopsTaken) {
     // Parse the Protobuf Data message
     size_t offset = 0;
     uint32_t portnum = 0;
@@ -1438,7 +1489,7 @@ void MeshService::handleDecryptedData(uint32_t from, uint32_t to, uint32_t id, c
             n = pbReadVarint(data + offset, len - offset, subLen);
             if (n == 0) break;
             offset += n;
-            if (offset + subLen > len) break;
+            if (subLen > len - offset) break;   // wrap-safe bounds check (subLen is a network varint)
             if (fieldNum == 2) {
                 appPayload = data + offset;
                 appPayloadLen = (size_t)subLen;
@@ -1535,7 +1586,7 @@ void MeshService::handleDecryptedData(uint32_t from, uint32_t to, uint32_t id, c
         if (requestId != 0) {
             if (!haveErr || errCode == 0) {
                 ESP_LOGI(TAG, "ACK for packet 0x%08x from !%08x", (unsigned)requestId, (unsigned)from);
-                markMessageAcked(requestId);
+                markMessageAcked(requestId, from);
             } else {
                 ESP_LOGW(TAG, "NAK for packet 0x%08x from !%08x: %s (%u)", (unsigned)requestId, (unsigned)from,
                          routingErrorName(errCode), (unsigned)errCode);
@@ -1646,7 +1697,7 @@ void MeshService::handleDecryptedData(uint32_t from, uint32_t to, uint32_t id, c
                 n = pbReadVarint(appPayload + uOff, appPayloadLen - uOff, slen);
                 if (n == 0) break;
                 uOff += n;
-                if (uOff + slen > appPayloadLen) break;
+                if (slen > appPayloadLen - uOff) break;   // wrap-safe bounds check
 
                 if (field == 2) { // long_name
                     size_t c = slen < (sizeof(longName) - 1) ? slen : (sizeof(longName) - 1);
@@ -1714,6 +1765,9 @@ void MeshService::handleDecryptedData(uint32_t from, uint32_t to, uint32_t id, c
         float voltVal = 0.0f;
         bool hasEnv = false;
         float envTemp = 0.0f, envHum = 0.0f, envPress = 0.0f, envIaq = 0.0f;
+        // A partial environment_metrics message carries only some fields: remember which ones are
+        // actually present, so the missing ones do not zero out values we already know for the node.
+        bool hasTemp = false, hasHum = false, hasPress = false, hasIaq = false;
         bool hasAir = false;
         float airPm25 = 0.0f;
 
@@ -1730,7 +1784,7 @@ void MeshService::handleDecryptedData(uint32_t from, uint32_t to, uint32_t id, c
                 n = pbReadVarint(appPayload + tOff, appPayloadLen - tOff, subLen);
                 if (n == 0) break;
                 tOff += n;
-                if (tOff + subLen > appPayloadLen) break;
+                if (subLen > appPayloadLen - tOff) break;   // wrap-safe bounds check
 
                 if (field == 2) { // DeviceMetrics
                     size_t mOff = 0;
@@ -1776,15 +1830,15 @@ void MeshService::handleDecryptedData(uint32_t from, uint32_t to, uint32_t id, c
                             float fv = 0.0f;
                             memcpy(&fv, appPayload + tOff + mOff, 4);
                             mOff += 4;
-                            if (mField == 1) { envTemp = fv; hasEnv = true; }
-                            else if (mField == 2) { envHum = fv; hasEnv = true; }
-                            else if (mField == 3) { envPress = fv; hasEnv = true; }
+                            if (mField == 1) { envTemp = fv; hasEnv = true; hasTemp = true; }
+                            else if (mField == 2) { envHum = fv; hasEnv = true; hasHum = true; }
+                            else if (mField == 3) { envPress = fv; hasEnv = true; hasPress = true; }
                         } else if (mWtype == 0) {
                             uint64_t mv = 0;
                             size_t mn2 = pbReadVarint(appPayload + tOff + mOff, subLen - mOff, mv);
                             if (mn2 == 0) break;
                             mOff += mn2;
-                            if (mField == 7) { envIaq = (float)mv; hasEnv = true; }
+                            if (mField == 7) { envIaq = (float)mv; hasEnv = true; hasIaq = true; }
                         } else if (mWtype == 2) {
                             uint64_t sl = 0;
                             size_t mn2 = pbReadVarint(appPayload + tOff + mOff, subLen - mOff, sl);
@@ -1851,12 +1905,10 @@ void MeshService::handleDecryptedData(uint32_t from, uint32_t to, uint32_t id, c
             for (auto& n : _nodes) {
                 if (n.nodeNum == from) {
                     n.hasEnvMetrics = true;
-                    if (hasEnv) {
-                        n.temperature = envTemp;
-                        n.humidity = envHum;
-                        n.pressure = envPress;
-                        n.iaq = envIaq;
-                    }
+                    if (hasTemp) n.temperature = envTemp;
+                    if (hasHum) n.humidity = envHum;
+                    if (hasPress) n.pressure = envPress;
+                    if (hasIaq) n.iaq = envIaq;
                     if (hasAir) n.pm25 = airPm25;
                     ESP_LOGI(TAG, "Env telemetry for !%08x: T=%.1fC H=%.1f%% P=%.1fhPa IAQ=%.0f PM2.5=%.0f",
                              (unsigned)from, n.temperature, n.humidity, n.pressure, n.iaq, n.pm25);
@@ -1931,8 +1983,12 @@ void MeshService::handleDecryptedData(uint32_t from, uint32_t to, uint32_t id, c
         }
 
     // ---------------- TRACEROUTE_APP ----------------
-    } else if (portnum == 70 && appPayload && appPayloadLen > 0) {
-        handleTracerouteReceived(from, to, id, appPayload, appPayloadLen, requestId != 0, chanKey, chanKeyLen, snr);
+    // An empty RouteDiscovery (0 bytes) is a legit *request*: the official apps and our own
+    // sendTraceroute() encode "no route yet" as an empty payload, so do not require appPayloadLen > 0
+    // for requests (requestId == 0), or the traceroute would never get an answer.
+    } else if (portnum == 70 && (appPayloadLen > 0 || requestId == 0)) {
+        handleTracerouteReceived(from, to, id, appPayload, appPayloadLen, requestId != 0, chanKey, chanKeyLen,
+                                 chanHash, snr);
         uiNeedsRefresh = true;
 
     // ---------------- WAYPOINT_APP ----------------
@@ -1969,7 +2025,7 @@ void MeshService::handleDecryptedData(uint32_t from, uint32_t to, uint32_t id, c
                 size_t n2 = pbReadVarint(appPayload + wOff, appPayloadLen - wOff, slen);
                 if (n2 == 0) break;
                 wOff += n2;
-                if (wOff + slen > appPayloadLen) break;
+                if (slen > appPayloadLen - wOff) break;   // wrap-safe bounds check
                 if (field == 6) {
                     size_t c = slen < (sizeof(wName) - 1) ? slen : (sizeof(wName) - 1);
                     memcpy(wName, appPayload + wOff, c);
@@ -2011,7 +2067,7 @@ void MeshService::handleDecryptedData(uint32_t from, uint32_t to, uint32_t id, c
             size_t n = pbReadVarint(appPayload + sOff, appPayloadLen - sOff, slen);
             if (n > 0) {
                 sOff += n;
-                if (sOff + slen <= appPayloadLen) {
+                if (slen <= appPayloadLen - sOff) {   // wrap-safe bounds check
                     size_t c = slen < (sizeof(statusText) - 1) ? slen : (sizeof(statusText) - 1);
                     memcpy(statusText, appPayload + sOff, c);
                     statusText[c] = '\0';
@@ -2048,7 +2104,7 @@ void MeshService::handleDecryptedData(uint32_t from, uint32_t to, uint32_t id, c
                 size_t n2 = pbReadVarint(appPayload + bOff, appPayloadLen - bOff, slen);
                 if (n2 == 0) break;
                 bOff += n2;
-                if (bOff + slen > appPayloadLen) break;
+                if (slen > appPayloadLen - bOff) break;   // wrap-safe bounds check
                 if (field == 1) {
                     size_t c = slen < (sizeof(beaconText) - 1) ? slen : (sizeof(beaconText) - 1);
                     memcpy(beaconText, appPayload + bOff, c);
@@ -2290,9 +2346,10 @@ bool MeshService::relayAllowedFor(uint32_t from) const {
     return true;
 }
 
-void MeshService::cancelRelayFor(uint32_t id) {
+void MeshService::cancelRelayFor(uint32_t id, uint32_t from) {
     for (auto it = _pendingRelays.begin(); it != _pendingRelays.end(); ) {
-        if (it->id == id) {
+        // from == 0: match on id alone (an in-transit ACK only carries the request id)
+        if (it->id == id && (from == 0 || it->from == from)) {
             it = _pendingRelays.erase(it);
         } else {
             ++it;
@@ -2542,7 +2599,8 @@ bool MeshService::transmitRaw(const uint8_t* buf, size_t len, bool bypassDutyCyc
 bool MeshService::sendDataPacket(uint32_t dest, uint32_t portnum, const uint8_t* payload, size_t payloadLen,
                                  bool wantResponse, bool wantAck, bool allowPki, uint8_t* rawOut, size_t* rawLenOut,
                                  uint32_t* packetIdOut, bool* usedPkiOut, uint32_t requestId, uint32_t forcedId,
-                                 bool bypassDutyCycle) {
+                                 bool bypassDutyCycle, const uint8_t* forceKey, uint8_t forceKeyLen,
+                                 int32_t forceChanHash) {
     if (dest == 0 || dest == _localNodeNum) return false;
     const bool isBroadcast = (dest == NODENUM_BROADCAST);
     const uint32_t pktId = (forcedId != 0) ? forcedId : ((uint32_t)esp_random() | 1u);
@@ -2597,7 +2655,7 @@ bool MeshService::sendDataPacket(uint32_t dest, uint32_t portnum, const uint8_t*
 
     uint8_t cipherData[265];
     size_t cipherLen = 0;
-    uint8_t chanHash = getTxChannelHash();
+    uint8_t chanHash = (forceChanHash >= 0) ? (uint8_t)forceChanHash : getTxChannelHash();
     if (usePki) {
         if (!pkiEncryptPayload(pkiKey, pktId, _localNodeNum, dataBuf, dLen, cipherData)) {
             ESP_LOGE(TAG, "PKI encryption failed for !%08x", (unsigned)dest);
@@ -2605,7 +2663,11 @@ bool MeshService::sendDataPacket(uint32_t dest, uint32_t portnum, const uint8_t*
         }
         cipherLen = dLen + 12;
     } else {
-        aesCtrCryptN(getTxChannelKey(), getTxChannelKeyLen(), pktId, _localNodeNum, dataBuf, dLen, cipherData);
+        // forceKey: reply on the very channel the request came in on (secondary/learned channels),
+        // instead of whatever channel we currently transmit on.
+        const uint8_t* encKey = forceKey ? forceKey : getTxChannelKey();
+        uint8_t encKeyLen = forceKey ? forceKeyLen : getTxChannelKeyLen();
+        aesCtrCryptN(encKey, encKeyLen, pktId, _localNodeNum, dataBuf, dLen, cipherData);
         cipherLen = dLen;
         if (!isBroadcast && allowPki && (portnum == 1 || portnum == 67)) {
             const MeshNode* peer = findNode(dest);
@@ -2788,7 +2850,7 @@ bool MeshService::sendDirectMessage(uint32_t toNode, const char* text) {
              (unsigned)rawLen);
 
     // Meshtastic >= 2.5 drops channel-encrypted ("legacy") DMs, so when the peer key is still unknown ask
-    // for a NodeInfo and silently re-send the very same packet id as a real PKI DM once the key arrives.
+    // for a NodeInfo and silently re-send as a real PKI DM (with a fresh packet id) once the key arrives.
     if (!usedPki && _pkiEnabled && _hasLocalKeys) {
         const MeshNode* peer = findNode(toNode);
         if (!peer || (!peer->hasPublicKey && !peer->isLicensed)) {
@@ -2869,8 +2931,15 @@ size_t MeshService::buildNodeInfoPayload(uint8_t* out, size_t cap) const {
         return true;
     };
 
+    // User.long_name is "limited to 24 bytes of UTF-8" on the wire: peers truncate longer names, so
+    // clamp here (without splitting a multi-byte character) or the name we see differs from theirs.
+    size_t longLen = strlen(_localLongName);
+    if (longLen > 24) {
+        longLen = 24;
+        while (longLen > 0 && ((unsigned char)_localLongName[longLen] & 0xC0) == 0x80) longLen--;
+    }
     writeBytesField(1, _localIdStr, strlen(_localIdStr));
-    writeBytesField(2, _localLongName, strlen(_localLongName));
+    writeBytesField(2, _localLongName, longLen);
     writeBytesField(3, _localShortName, strlen(_localShortName));
 
     uint8_t mac[6] = {0};
@@ -2892,11 +2961,11 @@ size_t MeshService::buildNodeInfoPayload(uint8_t* out, size_t cap) const {
     return uLen;
 }
 
-void MeshService::sendNodeInfoTo(uint32_t dest, bool wantResponse, uint32_t requestId) {
-    if (dest == 0 || (dest == _localNodeNum && dest != NODENUM_BROADCAST)) return;
+bool MeshService::sendNodeInfoTo(uint32_t dest, bool wantResponse, uint32_t requestId) {
+    if (dest == 0 || (dest == _localNodeNum && dest != NODENUM_BROADCAST)) return false;
     uint8_t userBuf[200];
     size_t uLen = buildNodeInfoPayload(userBuf, sizeof(userBuf));
-    if (uLen == 0) return;
+    if (uLen == 0) return false;
 
     uint8_t raw[300];
     size_t rawLen = sizeof(raw);
@@ -2906,7 +2975,9 @@ void MeshService::sendNodeInfoTo(uint32_t dest, bool wantResponse, uint32_t requ
         _lastNodeInfoTx = millis();
         ESP_LOGI(TAG, "NodeInfo sent to %s (user=%u bytes, wantResp=%u)",
                  (dest == NODENUM_BROADCAST) ? "broadcast" : "peer", (unsigned)uLen, wantResponse ? 1 : 0);
+        return true;
     }
+    return false;
 }
 
 void MeshService::broadcastNodeInfo(bool wantResponse) {
@@ -2931,17 +3002,22 @@ void MeshService::handleNodeInfoRequest(uint32_t from, bool wantResponse, uint32
             ESP_LOGD(TAG, "NodeInfo reply to !%08x suppressed (node reply within 60s)", (unsigned)from);
             return;
         }
-        node->lastNodeInfoReply = now;
     }
 
+    // Mark the throttles only once the reply is actually queued: a full deferred queue must not
+    // burn the 60s/4s budgets for a reply that never goes out.
+    if (!queueDeferred(DeferredKind::NodeInfoUnicast, from, 400 + (esp_random() % 800), requestId)) {
+        ESP_LOGW(TAG, "NodeInfo reply to !%08x not queued (deferred queue full)", (unsigned)from);
+        return;
+    }
+    if (node) node->lastNodeInfoReply = now;
     _lastNodeInfoRequestFrom = from;
     _lastNodeInfoRequestReply = now;
-    queueDeferred(DeferredKind::NodeInfoUnicast, from, 400 + (esp_random() % 800), requestId);
     ESP_LOGI(TAG, "Peer !%08x asked for our NodeInfo -> queued unicast reply", (unsigned)from);
 }
 
-void MeshService::requestNodeInfo(uint32_t nodeNum) {
-    if (nodeNum == 0 || nodeNum == NODENUM_BROADCAST || nodeNum == _localNodeNum) return;
+bool MeshService::requestNodeInfo(uint32_t nodeNum) {
+    if (nodeNum == 0 || nodeNum == NODENUM_BROADCAST || nodeNum == _localNodeNum) return false;
 
     // Official semantics: a unicast NodeInfo of our own with want_response set makes the peer reply
     // with its NodeInfo (which carries the public key we need for PKI direct messages). Empty-payload
@@ -2962,22 +3038,35 @@ void MeshService::requestNodeInfo(uint32_t nodeNum) {
         if ((now - slot->lastMillis) < NODEINFO_REQUEST_COOLDOWN_MS) {
             ESP_LOGD(TAG, "NodeInfo request to !%08x still in cooldown (%us ago)", (unsigned)nodeNum,
                      (unsigned)((now - slot->lastMillis) / 1000));
-            return;
+            return false;
         }
     } else {
         slot = freeSlot ? freeSlot : expiredSlot;
         if (!slot) {
-            // Every slot is inside its 12h window. Evicting one would let us re-ask a peer too early,
-            // which resets the peer's reply-suppression window and makes its answer impossible.
-            ESP_LOGW(TAG, "NodeInfo request table full: skipping request to !%08x", (unsigned)nodeNum);
-            return;
+            // Every slot is inside its 12h window: steal the one closest to expiry instead of
+            // refusing the request. An early re-ask of a quiet peer is a smaller evil than a DM that
+            // can never get the public key it needs (the peer reply-suppression only bites when we
+            // hammer the same node; here we just free the least recently used slot).
+            NodeInfoRequest* oldest = &_nodeInfoRequests[0];
+            for (auto& r : _nodeInfoRequests) {
+                if ((int32_t)(r.lastMillis - oldest->lastMillis) < 0) oldest = &r;
+            }
+            ESP_LOGW(TAG, "NodeInfo request table full: reusing oldest slot (was !%08x)",
+                     (unsigned)oldest->nodeNum);
+            slot = oldest;
         }
+    }
+    // Consume the 12h slot only when the frame really goes out: a duty-cycle-blocked request must
+    // not make this peer unaskable for half a day.
+    if (!sendNodeInfoTo(nodeNum, /*wantResponse=*/true, 0)) {
+        ESP_LOGW(TAG, "NodeInfo request to !%08x not sent (TX blocked): cooldown not consumed", (unsigned)nodeNum);
+        return false;
     }
     slot->nodeNum = nodeNum;
     slot->lastMillis = now;
 
     ESP_LOGI(TAG, "Asking !%08x for its NodeInfo (unicast, want_response) - next attempt in 12h", (unsigned)nodeNum);
-    sendNodeInfoTo(nodeNum, /*wantResponse=*/true, 0);
+    return true;
 }
 
 void MeshService::sendTelemetryTo(uint32_t dest, bool wantResponse, uint32_t requestId) {
@@ -3247,7 +3336,7 @@ bool MeshService::buildTraceroutePayload(uint8_t* out, size_t outCap, size_t& ou
             size_t n2 = pbReadVarint(inPayload + off, inLen - off, sl);
             if (n2 == 0) return false;
             off += n2;
-            if (off + sl > inLen) return false;
+            if (sl > inLen - off) return false;   // wrap-safe bounds check (sl is a network varint)
             size_t pOff = 0;
             if (field == 1 || field == 3) {
                 while (pOff + 4 <= sl) {
@@ -3364,29 +3453,31 @@ bool MeshService::sendTraceroute(uint32_t dest) {
     return true;
 }
 
-void MeshService::sendTracerouteReply(uint32_t dest, uint32_t requestId, const uint8_t* payload, size_t len) {
+void MeshService::sendTracerouteReply(uint32_t dest, uint32_t requestId, const uint8_t* payload, size_t len,
+                                      const uint8_t* chanKey, uint8_t chanKeyLen, uint8_t chanHash) {
     uint8_t raw[300];
     size_t rawLen = sizeof(raw);
     uint32_t pktId = 0;
     bool usedPki = false;
-    if (sendDataPacket(dest, 70, payload, len, false, false, false, raw, &rawLen, &pktId, &usedPki, requestId)) {
+    if (sendDataPacket(dest, 70, payload, len, false, false, false, raw, &rawLen, &pktId, &usedPki, requestId, 0,
+                       false, chanKey, chanKeyLen, chanHash)) {
         ESP_LOGI(TAG, "Traceroute reply sent to !%08x (request 0x%08x)", (unsigned)dest, (unsigned)requestId);
     }
 }
 
 void MeshService::handleTracerouteReceived(uint32_t from, uint32_t to, uint32_t id, const uint8_t* payload, size_t len,
-                                           bool isResponse, const uint8_t* chanKey, uint8_t chanKeyLen, float snr) {
-    (void)chanKey;
-    (void)chanKeyLen;
+                                           bool isResponse, const uint8_t* chanKey, uint8_t chanKeyLen, uint8_t chanHash,
+                                           float snr) {
     const bool isToUs = (to == _localNodeNum);
 
     if (isToUs && !isResponse) {
-        // We are the destination: append our SNR and reply to the originator
+        // We are the destination: append our SNR and reply to the originator. The reply goes out on
+        // the channel (key + hash) the request came in on, or the originator could not decrypt it.
         uint8_t replyPayload[233];
         size_t replyLen = 0;
         if (buildTraceroutePayload(replyPayload, sizeof(replyPayload), replyLen, payload, len,
                                    /*isResponse=*/false, /*appendId=*/false, _localNodeNum, snr)) {
-            sendTracerouteReply(from, id, replyPayload, replyLen);
+            sendTracerouteReply(from, id, replyPayload, replyLen, chanKey, chanKeyLen, chanHash);
         }
         return;
     }
@@ -3436,7 +3527,7 @@ void MeshService::handleTracerouteReceived(uint32_t from, uint32_t to, uint32_t 
                 size_t n2 = pbReadVarint(finalPayload + off, finalLen - off, sl);
                 if (n2 == 0) break;
                 off += n2;
-                if (off + sl > finalLen) break;
+                if (sl > finalLen - off) break;   // wrap-safe bounds check
                 size_t pOff = 0;
                 if (field == 1 || field == 3) {
                     while (pOff + 4 <= sl) {
@@ -3458,6 +3549,7 @@ void MeshService::handleTracerouteReceived(uint32_t from, uint32_t to, uint32_t 
                 }
                 off += sl;
             } else if (wtype == 1) {
+                if (off + 8 > finalLen) break;
                 off += 8;
             } else break;
         }
@@ -3502,13 +3594,14 @@ void MeshService::handleTracerouteReceived(uint32_t from, uint32_t to, uint32_t 
     }
 }
 
-void MeshService::queueDeferred(DeferredKind kind, uint32_t dest, uint32_t delayMs, uint32_t arg, float snr) {
-    if (dest == 0 || dest == _localNodeNum) return;
+bool MeshService::queueDeferred(DeferredKind kind, uint32_t dest, uint32_t delayMs, uint32_t arg, float snr) {
+    if (dest == 0 || dest == _localNodeNum) return false;
 
-    // Deduplication: if an action of the same kind is already queued for this destination, do not add duplicate
+    // Deduplication: only collapse identical actions. Two different requests (e.g. two traceroutes
+    // with different request ids) for the same destination are legitimate work, not duplicates.
     for (auto& item : _deferredSends) {
-        if (item.kind == kind && item.dest == dest) {
-            return;
+        if (item.kind == kind && item.dest == dest && item.arg == arg) {
+            return true; // the action is already scheduled: it will happen
         }
     }
 
@@ -3516,7 +3609,7 @@ void MeshService::queueDeferred(DeferredKind kind, uint32_t dest, uint32_t delay
     if (_deferredSends.size() >= MAX_DEFERRED_SENDS) {
         ESP_LOGW(TAG, "Deferred sends queue full (%u), dropping kind=%u to !%08x",
                  (unsigned)_deferredSends.size(), (unsigned)kind, (unsigned)dest);
-        return;
+        return false;
     }
 
     DeferredSend d;
@@ -3526,6 +3619,7 @@ void MeshService::queueDeferred(DeferredKind kind, uint32_t dest, uint32_t delay
     d.arg = arg;
     d.snr = snr;
     _deferredSends.push_back(d);
+    return true;
 }
 
 void MeshService::queueDeferredDm(uint32_t dest, const char* text, uint32_t packetId, uint32_t delayMs) {
@@ -3576,7 +3670,7 @@ void MeshService::processDeferredSends() {
     }
 
     for (auto it = _deferredSends.begin(); it != _deferredSends.end(); ) {
-        if (now < it->atMillis) {
+        if ((int32_t)(now - it->atMillis) < 0) {   // wrap-safe deadline check
             ++it;
             continue;
         }
@@ -3614,11 +3708,33 @@ void MeshService::processDeferredSends() {
                     size_t rawLen = sizeof(raw);
                     uint32_t pid = 0;
                     bool usedPki = false;
-                    // Same packet id as the first (channel-encrypted) attempt: receivers dedup on (from,id)
+                    // New packet id, not the original one: the first (channel-encrypted) attempt already
+                    // registered (from,id) in the receiver's dedup table (a >= 2.5 peer also ACKs the
+                    // legacy DM it dropped), so a re-send with the same id is discarded as a duplicate.
                     if (sendDataPacket(it->dest, 1, (const uint8_t*)it->text, strlen(it->text), false, true, true,
-                                       raw, &rawLen, &pid, &usedPki, 0, it->arg) && usedPki) {
-                        ESP_LOGI(TAG, "Deferred DM re-sent with PKI to !%08x (id 0x%08x)", (unsigned)it->dest,
-                                 (unsigned)it->arg);
+                                       raw, &rawLen, &pid, &usedPki, 0, 0) && usedPki) {
+                        ESP_LOGI(TAG, "Deferred DM re-sent with PKI to !%08x (new id 0x%08x, was 0x%08x)",
+                                 (unsigned)it->dest, (unsigned)pid, (unsigned)it->arg);
+                        // Follow the id change: the retry queue must retransmit the PKI frame (not the
+                        // legacy one) and the chat entry must match the ACK of the new id.
+                        for (auto& pa : _pendingAcks) {
+                            if (pa.packetId == it->arg && pa.toNode == it->dest) {
+                                pa.packetId = pid;
+                                if (rawLen <= sizeof(pa.rawPacket)) {
+                                    memcpy(pa.rawPacket, raw, rawLen);
+                                    pa.rawPacketLen = rawLen;
+                                }
+                                pa.retriesLeft = 3;
+                                pa.lastSentMillis = millis();
+                                break;
+                            }
+                        }
+                        for (auto& m : _directMessages) {
+                            if (m.id == it->arg && m.toNode == it->dest && m.isOutgoing) {
+                                m.id = pid;
+                                break;
+                            }
+                        }
                     } else {
                         ESP_LOGW(TAG, "Deferred PKI re-send to !%08x failed", (unsigned)it->dest);
                     }
@@ -3627,8 +3743,9 @@ void MeshService::processDeferredSends() {
                 } else if (it->attemptsLeft > 0) {
                     it->attemptsLeft--;
                     it->atMillis = millis() + 15000;
-                    requestNodeInfo(it->dest);
-                    didTx = true;
+                    // didTx only when the NodeInfo request really went out: a throttled request is
+                    // not a transmission and must not stall the rest of the deferred queue.
+                    didTx = requestNodeInfo(it->dest);
                     shouldErase = false;
                 } else {
                     ESP_LOGW(TAG, "Giving up PKI retry for DM to !%08x (no public key)", (unsigned)it->dest);
@@ -3805,6 +3922,8 @@ void MeshService::setLocalName(const char* longName, const char* shortName) {
 }
 
 void MeshService::setTxPower(int8_t powerDbm) {
+    if (powerDbm < -3) powerDbm = -3;   // SX1262 output range
+    if (powerDbm > 22) powerDbm = 22;
     _txPower = powerDbm;
     if (!_radio) return;
     if (!applyRadioConfig()) {
@@ -3895,11 +4014,23 @@ void MeshService::applyModemPresetLocked(ModemPreset preset) {
 bool MeshService::applyRadioConfig() {
     if (!_radio) return false;
     if (!lockRadio(300)) return false;
-    _radio->setOutputPower(_txPower);
-    _radio->setFrequency(_frequency);
-    applyModemPresetLocked(_modemPreset);
-    _radio->startReceive();
+    // A corrupted NVS/config.json must not reach the chip unclamped: RadioLib rejects out-of-range
+    // values and, without these checks, the node would keep "succeeding" on the old configuration.
+    int8_t pwr = _txPower;
+    if (pwr < -3) pwr = -3;
+    if (pwr > 22) pwr = 22;
+    int16_t st = _radio->setOutputPower(pwr);
+    if (st == RADIOLIB_ERR_NONE) st = _radio->setFrequency(_frequency);
+    if (st == RADIOLIB_ERR_NONE) {
+        applyModemPresetLocked(_modemPreset);
+        st = _radio->startReceive();
+    }
     unlockRadio();
+    if (st != RADIOLIB_ERR_NONE) {
+        ESP_LOGE(TAG, "Radio config failed (%d): %d dBm, %.3f MHz, preset %s", (int)st, (int)pwr, _frequency,
+                 getPresetCanonicalName(_modemPreset));
+        return false;
+    }
     return true;
 }
 
@@ -3954,6 +4085,16 @@ void MeshService::saveConfig(bool withNodes) {
     cfg.nodeIdSalt = _nodeIdSalt;
     cfg.positionIntervalSec = _positionIntervalSec;
     cfg.meshTimeSync = _meshTimeSync;
+    // Keep the learned channel pair across saves: this struct is zeroed here and saveSettings()
+    // persists the lc* keys too, so leaving them empty silently wiped the learned channel on every
+    // settings change (the node silently fell back to its own hash after a reboot).
+    cfg.learnedChanValid = _learnedHashValid;
+    cfg.learnedChanHash = _learnedHash;
+    cfg.learnedChanKeyLen = _learnedHashValid ? _learnedKeyLen : 0;
+    if (_learnedHashValid && _learnedKeyLen > 0) {
+        memcpy(cfg.learnedChanKey, _learnedKey, _learnedKeyLen);
+    }
+    cfg.learnedChanHits = (_learnedCount > 0xFFFFu) ? 0xFFFFu : (uint16_t)_learnedCount;
     strncpy(cfg.primaryChannelName, _primaryChannelName, sizeof(cfg.primaryChannelName) - 1);
     cfg.primaryPskLen = _primaryPskLen;
     memcpy(cfg.primaryPsk, _primaryPsk, sizeof(cfg.primaryPsk));
@@ -4021,6 +4162,23 @@ const char* MeshService::getFrequencyRegionName(float freq) {
 }
 
 void MeshService::sendAck(uint32_t toNode, uint32_t originalPacketId) {
+    // ACKs bypass the duty budget on purpose (they are protocol-critical), so a flood of spoofed
+    // want_ack frames would make us transmit without any bound. Cap the rate: normal conversations
+    // stay far below this, an attacker gets a few ACKs per second instead of one per frame.
+    static uint32_t s_ackWindowStart = 0;
+    static uint8_t s_ackWindowCount = 0;
+    uint32_t now = millis();
+    if (s_ackWindowStart == 0 || (int32_t)(now - s_ackWindowStart) > 5000) {
+        s_ackWindowStart = now;
+        s_ackWindowCount = 0;
+    }
+    if (s_ackWindowCount >= 8) {
+        ESP_LOGW(TAG, "ACK rate limit hit: dropping ACK to !%08x for 0x%08x", (unsigned)toNode,
+                 (unsigned)originalPacketId);
+        return;
+    }
+    s_ackWindowCount++;
+
     uint8_t routingBuf[16];
     size_t rLen = 0;
     // Routing { error_reason = NONE }: field 3, wiretype 0
@@ -4043,10 +4201,12 @@ void MeshService::sendAck(uint32_t toNode, uint32_t originalPacketId) {
     ESP_LOGI(TAG, "Meshtastic ACK sent to !%08x for packet 0x%08x", (unsigned)toNode, (unsigned)originalPacketId);
 }
 
-void MeshService::markMessageAcked(uint32_t id) {
+void MeshService::markMessageAcked(uint32_t id, uint32_t fromNode) {
+    // fromNode (0 = unknown): an ACK only makes sense for the message we sent *to that peer*; an id
+    // collision between two concurrent DMs must not tick the wrong bubble.
     bool found = false;
     for (auto& m : _directMessages) {
-        if (m.id == id && m.isOutgoing) {
+        if (m.id == id && m.isOutgoing && (fromNode == 0 || m.toNode == fromNode)) {
             m.isAcked = true;
             m.isFailed = false;
             found = true;
@@ -4060,7 +4220,7 @@ void MeshService::markMessageAcked(uint32_t id) {
         }
     }
     for (auto it = _pendingAcks.begin(); it != _pendingAcks.end(); ) {
-        if (it->packetId == id) {
+        if (it->packetId == id && (fromNode == 0 || it->toNode == fromNode)) {
             it = _pendingAcks.erase(it);
         } else {
             ++it;

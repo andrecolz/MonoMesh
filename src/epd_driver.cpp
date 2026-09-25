@@ -16,6 +16,12 @@ bool EPDDriver::init() {
     M5.Display.waitDisplay();
 
     ESP_LOGI(TAG, "EPD initialized: %dx%d", M5.Display.width(), M5.Display.height());
+    if (M5.Display.width() != 480 || M5.Display.height() != 800) {
+        // Every layout in the firmware is hardcoded for the 480x800 panel: report it instead of
+        // drawing garbage that looks like a software bug.
+        ESP_LOGE(TAG, "Unexpected panel geometry (expected 480x800)");
+        return false;
+    }
     return true;
 }
 
@@ -67,6 +73,14 @@ void EPDDriver::flushRect(int32_t x, int32_t y, int32_t w, int32_t h, bool count
                 fullClear();
                 return;
             }
+        }
+    } else if (countPartial) {
+        // flushRect always forces the 1-bit LUT below, i.e. it IS a partial refresh whatever the
+        // current mode is: count it too, or the anti-ghosting policy differs from the grayscale path.
+        _partialRefreshCount++;
+        if (_antiGhostThreshold > 0 && _partialRefreshCount >= _antiGhostThreshold) {
+            fullClear();
+            return;
         }
     }
 

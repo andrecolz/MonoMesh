@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <esp_log.h>
+#include <esp_timer.h>
 #include <WiFi.h>
 #include "alarm_service.h"
 #include "bsp_papermono.h"
@@ -99,7 +100,9 @@ static void checkLowBattery() {
     const uint32_t now = millis();
     if (now - s_lastCheck < 10000) return;
     s_lastCheck = now;
-    if (now < 60000) return; // let the first readings settle (boot/USB transients)
+    // Timer-based: a "millis() < 60000" test re-armed itself for a minute every time millis() wrapped.
+    // 20 s is enough for the boot/USB transients to settle (charging state is checked right below).
+    if (esp_timer_get_time() < 20000000LL) return;
 
     BatteryState bs = BSP::getInstance().getBatteryState();
     if (bs.isCharging) {
@@ -278,6 +281,9 @@ static void handleLowPowerMode() {
         M5.BtnB.wasClicked();
 
         bsp.exitLowPower(mesh.getFrontlight());
+        // The peek-light deadline must not survive the exit: re-entering within CLOCK_PEEK_MS would
+        // otherwise "expire" a light nobody turned on and force the user's frontlight to 0.
+        s_clockLightUntil = 0;
         mesh.resumeRadio();
         // The SD was remounted: persist here the nodes/messages collected while it was off
         mesh.requestNodePersist();

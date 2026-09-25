@@ -1,6 +1,7 @@
 #include "alarm_service.h"
 #include "bsp_papermono.h"
 #include <esp_log.h>
+#include <Preferences.h>
 #include <cstring>
 
 static constexpr const char* TAG = "MonoMesh-Alarm";
@@ -63,6 +64,26 @@ bool alarmMatches(const AlarmRecord& a, int y, int mo, int d, int rtcWeekday, in
 
 } // namespace
 
+// The "already fired in this minute" marker must survive an unexpected reboot inside the same
+// minute: checkNow() would otherwise ring the alarm a second time right after a crash/reset.
+static void persistFiredKey(int32_t key) {
+    Preferences p;
+    if (p.begin("monomesh", false)) {
+        p.putInt("firedMin", key);
+        p.end();
+    }
+}
+
+static int32_t loadFiredKey() {
+    Preferences p;
+    int32_t v = -1;
+    if (p.begin("monomesh", true)) {
+        v = p.getInt("firedMin", -1);
+        p.end();
+    }
+    return v;
+}
+
 void AlarmService::sanitize(AlarmRecord& a) {
     a.name[sizeof(a.name) - 1] = '\0';
     for (char* p = a.name; *p; ++p) {
@@ -74,7 +95,13 @@ void AlarmService::sanitize(AlarmRecord& a) {
     if (a.tone > 2) a.tone = 1;
     if (a.repeat == 0) {
         if (a.month < 1 || a.month > 12) a.month = 1;
-        if (a.year < 2023 || a.year > 2099) a.year = 2026;
+        if (a.year < 2023 || a.year > 2099) {
+            // Current year, not a hardcoded fallback: "2026" silently breaks every repaired date
+            // as soon as the clock passes it.
+            int y = 0, mo = 0, d = 0, hh = 0, mm = 0, ss = 0;
+            BSP::getInstance().getLocalDateTime(y, mo, d, hh, mm, ss);
+            a.year = (y >= 2023 && y <= 2099) ? (uint16_t)y : 2026;
+        }
         if (a.day < 1 || a.day > (uint8_t)daysInMonth(a.year, a.month)) {
             a.day = (uint8_t)daysInMonth(a.year, a.month);
         }
@@ -85,6 +112,7 @@ void AlarmService::init() {
     _alarms.clear();
     _ringing = false;
     _ringingIndex = 0;
+    _firedKey = loadFiredKey();
     StorageManager::getInstance().loadAlarms(_alarms);
     if (_alarms.size() > MAX_ALARMS) _alarms.resize(MAX_ALARMS);
 
@@ -92,19 +120,37 @@ void AlarmService::init() {
     // find the alarm due at this minute and ring it (M5Unified already cleared the RTC IRQ; the PM1
     // wake source is what tells us).
     if (BSP::getInstance().wasWokenByRtcAlarm()) {
-        int y = 0, mo = 0, d = 0, hh = 0, mm = 0, ss = 0;
-        BSP::getInstance().getLocalDateTime(y, mo, d, hh, mm, ss);
-        const int wd = BSP::getInstance().getLocalWeekday();
-        for (size_t i = 0; i < _alarms.size(); ++i) {
-            if (alarmMatches(_alarms[i], y, mo, d, wd, hh, mm)) {
-                ESP_LOGI(TAG, "Power-on wake by the RTC alarm: ringing '%s'", _alarms[i].name);
-                startRinging(i);
-                _firedKey = ((int32_t)toSerialDays(y, mo, d) * 1440) + hh * 60 + mm;
-                break;
+        if (!BSP::getInstance().isRtcValid()) {
+            ESP_LOGW(TAG, "RTC alarm wake but the clock is invalid: not ringing");
+        } else {
+            int y = 0, mo = 0, d = 0, hh = 0, mm = 0, ss = 0;
+            BSP::getInstance().getLocalDateTime(y, mo, d, hh, mm, ss);
+            int wd = BSP::getInstance().getLocalWeekday();
+            const int wakeHh = hh, wakeMm = mm;
+            // The boot (SD mount, radio init, e-paper splash) takes seconds: if it crosses the
+            // minute the RTC alarm fired in, the exact-minute match below would never hit and the
+            // alarm would be silently lost. Try the previous minute too (same day; a wake across
+            // midnight is rare enough to skip).
+            for (int back = 0; back < 2 && !_ringing; ++back) {
+                for (size_t i = 0; i < _alarms.size(); ++i) {
+                    if (alarmMatches(_alarms[i], y, mo, d, wd, hh, mm)) {
+                        ESP_LOGI(TAG, "Power-on wake by the RTC alarm: ringing '%s'", _alarms[i].name);
+                        startRinging(i);
+                        _firedKey = ((int32_t)toSerialDays(y, mo, d) * 1440) + wakeHh * 60 + wakeMm;
+                        persistFiredKey(_firedKey);
+                        break;
+                    }
+                }
+                if (_ringing || back == 1) break;
+                if (--mm < 0) {
+                    if (hh == 0) break;   // previous day not covered
+                    mm = 59;
+                    --hh;
+                }
             }
-        }
-        if (!_ringing) {
-            ESP_LOGW(TAG, "RTC alarm wake, but no enabled alarm matches %02d:%02d", hh, mm);
+            if (!_ringing) {
+                ESP_LOGW(TAG, "RTC alarm wake, but no enabled alarm matches %02d:%02d", wakeHh, wakeMm);
+            }
         }
     }
     ESP_LOGI(TAG, "Alarm service ready: %u alarm(s)", (unsigned)_alarms.size());
@@ -144,6 +190,7 @@ void AlarmService::checkNow() {
         if (!alarmMatches(_alarms[i], y, mo, d, wd, hh, mm)) continue;
         startRinging(i);
         _firedKey = key;
+        persistFiredKey(key);
         return;
     }
 }
@@ -354,14 +401,16 @@ bool AlarmService::armRtcAlarm() {
             // represent this date only when the next occurrence of that day of month IS the target
             // date. A farther date (e.g. +40 days) must not arm "day 20" and ring a month early; the
             // alarm still rings normally while the device is on, it just cannot wake from power off.
+            // The scan must start from *today*: skipping it meant that arming a next-month date while
+            // today shares its day of month (15/01 for a 15/02 alarm) rang tonight, a month early.
             int cy = y, cm = mo, cd = d;
-            bool dayMatches = (delta == 0); // today: the day-of-month alarm is already correct
-            for (int guard = 0; !dayMatches && guard < 32; ++guard) {
-                addDays(cy, cm, cd, 1);
+            bool dayMatches = false;
+            for (int guard = 0; guard < 32; ++guard) {
                 if (cd == a.day) {
                     dayMatches = (cy == a.year && cm == a.month && cd == a.day);
                     break;
                 }
+                addDays(cy, cm, cd, 1);
             }
             if (!dayMatches) {
                 ESP_LOGW(TAG, "Alarm '%s' is beyond the RTC day-alarm range: not a power-on wake", a.name);

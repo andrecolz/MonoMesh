@@ -13,14 +13,18 @@ Current release: **v1.0b (beta)**
 - **Mesh messaging** — broadcast channels and end-to-end encrypted direct
   messages (X25519 + AES-256-CCM, Meshtastic 2.5+ PKI), ACK/NAK, retries and
   managed-flooding relay, with unread badges and message history on screen.
-- **Node list** — name, model, MAC, PKI lock, RSSI/SNR and hop count; telemetry
-  (device, environment, air quality), traceroute, waypoints received and
-  NeighborInfo transmitted.
+- **Node list** — name, PKI lock, RSSI/SNR and hop count, with model, MAC and
+  coordinates in the detail panel; telemetry (device, environment, air quality),
+  traceroute, waypoints received and NeighborInfo transmitted.
 - **Offline maps** — a single `.mmap` container per region (recommended) or a
   PNG tile tree on MicroSD; pan, zoom, node pins, waypoints and "go to my
   position".
 - **Touch keyboard** — compose messages with uppercase/symbols and a scrolling
   text field; quick menu and physical buttons for page navigation.
+- **Calculator** — a basic four-operation calculator in expression mode
+  (parentheses and contextual percent) on a phone-style keypad; the expression
+  line and the big result refresh with a fast partial update. No scientific
+  functions and no history.
 - **On-screen settings** — region, modem preset, frequency, TX power, hop
   limit, channel name and PSK, node identity and role, broadcast intervals,
   TX duty-cycle budget, rebroadcast mode, buzzer mode, timezone/RTC, clock
@@ -47,6 +51,7 @@ python3 -m pip install -r requirements.txt
 
 # one .mmap container for the area around a point (recommended)
 python3 tools/mmap_converter.py --tui
+```
 
 Copy the resulting `.mmap` file into `/maps` on the MicroSD.
 

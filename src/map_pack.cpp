@@ -102,7 +102,11 @@ void MapPack::close() {
 
 bool MapPack::open(const char* path) {
     close();
-    _path = path ? path : "";
+    if (!path || path[0] == '\0') {
+        setError("no container path");
+        return false;
+    }
+    _path = path;
     _error.clear();
     _file = SD_MMC.open(path, FILE_READ);
     if (!_file) {
@@ -181,7 +185,14 @@ bool MapPack::open(const char* path) {
         rec.offPayload = rd32(zhead + 32);
         rec.info.payloadBytes = rd32(zhead + 36);
         rec.info.present = rd32(zhead + 40);
-        if (rec.info.nx == 0 || rec.info.ny == 0) continue;
+        // Corrupt-header guard: nx*ny can overflow 32-bit math (65536x65536 wraps to 0) and both
+        // `present` and the section offsets were never checked, so a truncated/hand-edited .mmap
+        // would make loadIndex()/tileAt() read out of bounds. Validate before keeping the record.
+        const uint64_t cells = (uint64_t)rec.info.nx * (uint64_t)rec.info.ny;
+        const uint32_t realSize = (uint32_t)_file.size();
+        if (rec.info.nx == 0 || rec.info.ny == 0 || cells > 16ULL * 1024 * 1024) continue;
+        if ((uint64_t)rec.info.present > cells) continue;
+        if (rec.offPresence >= realSize || rec.offPrefix >= realSize || rec.offIndex >= realSize) continue;
         _zooms.push_back(rec);
     }
     if (_zooms.empty()) {
@@ -225,8 +236,15 @@ const MapPack::ZoomInfo* MapPack::findZoom(int z) const {
 
 bool MapPack::loadIndex(const ZoomRec& rec) {
     releaseIndex();
-    const size_t presenceBytes = ((size_t)rec.info.nx * rec.info.ny + 7) / 8;
+    // 64-bit math: nx*ny with corrupt values wrapped to a tiny presenceBytes and the bitmap reads
+    // in tileAt() then went out of bounds. open() already validates the record; keep it safe here too.
+    const uint64_t cells = (uint64_t)rec.info.nx * (uint64_t)rec.info.ny;
+    const size_t presenceBytes = (size_t)((cells + 7) / 8);
     const size_t prefixBytes = ((size_t)rec.info.ny + 1) * 4;
+    if (presenceBytes > kIndexPsramLimit) {
+        setError("presence map too large");
+        return false;
+    }
     _presence = (uint8_t*)psramAlloc(presenceBytes);
     _prefix = (uint32_t*)psramAlloc(prefixBytes);
     if (!_presence || !_prefix) {
@@ -386,13 +404,10 @@ bool MapPack::selectedCentre(int& tileX, int& tileY) const {
 
 size_t MapPack::listRegions(std::vector<std::string>& out) {
     out.clear();
-    const char* roots[2] = {"/maps", "/sdcard/maps"};
-    for (const char* root : roots) {
-        File dir = SD_MMC.open(root);
-        if (!dir || !dir.isDirectory()) {
-            if (dir) dir.close();
-            continue;
-        }
+    // SD_MMC is already rooted at /sdcard, so "/sdcard/maps" resolved to /sdcard/sdcard/maps and
+    // never matched anything: /maps is the only real root.
+    File dir = SD_MMC.open("/maps");
+    if (dir && dir.isDirectory()) {
         while (File entry = dir.openNextFile()) {
             if (!entry.isDirectory()) {
                 const char* name = entry.name();
@@ -400,16 +415,14 @@ size_t MapPack::listRegions(std::vector<std::string>& out) {
                 base = base ? base + 1 : name;
                 const size_t len = base ? strlen(base) : 0;
                 if (len > 5 && strcasecmp(base + len - 5, ".mmap") == 0) {
-                    char full[96];
-                    snprintf(full, sizeof(full), "%s/%s", root, base);
-                    out.push_back(full);
+                    // std::string, not a fixed buffer: long region names were silently truncated.
+                    out.push_back(std::string("/maps/") + base);
                 }
             }
             entry.close();
         }
-        dir.close();
-        if (!out.empty()) break;
     }
+    if (dir) dir.close();
     std::sort(out.begin(), out.end());
     return out.size();
 }

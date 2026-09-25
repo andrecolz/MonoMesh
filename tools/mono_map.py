@@ -368,18 +368,45 @@ class MapWriter:
     # ---- tiles ----
     def add_tile_compressed(self, z: int, x: int, y: int, data: bytes,
                             blank: int = 0) -> int:
-        """Adds an already packed and deflated tile. Returns the stored length."""
+        """Adds an already packed and deflated tile. Returns the stored length.
+
+        The same (z, x, y) added twice replaces the previous tile: the counters
+        must describe what ends up in the container, never the overwritten entry.
+        """
         flags = 0
         if blank:
             flags = TILE_FLAG_BLANK | (TILE_FLAG_BLANK_BLACK if blank == 2 else 0)
             data = b""
-            self._blank += 1
-        if data:
-            self._tmp.write(data)
-        entry = (self._payload_size, len(data), flags)
-        self._payload_size += len(data)
-        self._entries.setdefault(z, {})[(x, y)] = entry
+        bucket = self._entries.setdefault(z, {})
+        prev = bucket.get((x, y))
+        if prev is None:
+            off = self._payload_size
+            if data:
+                self._tmp.write(data)
+                self._payload_size += len(data)
+        else:
+            self._tiles -= 1
+            if prev[2] & TILE_FLAG_BLANK:
+                self._blank -= 1
+            off, cap = prev[0], prev[1]
+            if len(data) <= cap or off + cap == self._payload_size:
+                # The payload stream is append-only, so a replacement reuses the
+                # old slot instead of leaving the overwritten payload as dead
+                # bytes; a trailing slot follows the new length exactly.
+                self._tmp.seek(off)
+                self._tmp.write(data)
+                if off + cap == self._payload_size:
+                    self._tmp.truncate(off + len(data))
+                    self._payload_size = off + len(data)
+                self._tmp.seek(0, os.SEEK_END)
+            else:
+                off = self._payload_size
+                self._tmp.write(data)
+                self._payload_size += len(data)
+        self._entries[z][(x, y)] = (off, len(data), flags)
         self._tiles += 1
+        if blank:
+            self._blank += 1
         return len(data)
 
     def add_tile_bits(self, z: int, x: int, y: int, payload: bytes,
@@ -448,6 +475,7 @@ class MapWriter:
         payload_start = (cursor + 3) & ~3
 
         sections = []  # (type, aux, offset, blob)
+        payload_total = 0
         for (z, x0, y0, nx, ny, pb, fb, ib) in plans:
             sec = bytearray(ZOOM_HEADER_SIZE + pb + fb + ib)
             presence_off = ZOOM_HEADER_SIZE
@@ -472,6 +500,7 @@ class MapWriter:
             for i, v in enumerate(prefix):
                 struct.pack_into("<I", sec, prefix_off + i * 4, v)
             payload_bytes = sum(e[1] for e in entries.values())
+            payload_total += payload_bytes
             ZOOM_STRUCT.pack_into(sec, 0, z, self.bits, FLAG_DEFLATE,
                                   x0, nx, y0, ny, presence_off, prefix_off, index_off,
                                   payload_start, payload_bytes, rank)
@@ -532,7 +561,9 @@ class MapWriter:
             "bytes": file_size,
             "tiles": self._tiles,
             "blank": self._blank,
-            "payload_bytes": self._payload_size,
+            # Referenced payload only: a replaced tile can leave dead bytes in
+            # the append-only stream, those are not part of the container content.
+            "payload_bytes": payload_total,
             "raw_bytes": self._raw_bytes,
             "zooms": tiles_per_zoom,
             "pois": len(self._pois),
@@ -652,7 +683,10 @@ class MapReader:
             if (info["presence"][i >> 3] >> (7 - (i & 7))) & 1:
                 rank += 1
         off, length, flags = TILE_STRUCT.unpack_from(info["index"], rank * TILE_ENTRY_SIZE)
-        if flags & TILE_FLAG_BLANK:
+        if flags & TILE_FLAG_BLANK or length == 0:
+            # length 0 is blank even without the flag, exactly like the firmware
+            # (map_pack.cpp skips the payload and the caller fills the tile):
+            # decompressing an empty stream would raise zlib.error.
             return None, flags
         with open(self.path, "rb") as fh:
             fh.seek(off)

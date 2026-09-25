@@ -7,6 +7,10 @@ static constexpr const char* TAG = "MonoMesh-Touch";
 namespace MonoMesh {
 
 bool TouchManager::init() {
+    // The INT line is read in update() but nothing configured the pin: it floated, so `panelActive`
+    // and the "INT usable" fallback were noise (either a needless M5.update() every loop, or a
+    // permanently-active gate that added latency to the touch response).
+    pinMode(Pins::TOUCH_INT, INPUT_PULLUP);
     ESP_LOGI(TAG, "Touch manager initialized (using M5.Touch.getTouchPointRaw)");
     return true;
 }
@@ -54,11 +58,19 @@ void TouchManager::update() {
                 _currentEvent.type = TouchEventType::Up;
             }
 
-            _currentEvent.x = _curX;
-            _currentEvent.y = _curY;
             _currentEvent.startX = _downX;
             _currentEvent.startY = _downY;
             _currentEvent.durationMs = dur;
+            if (_currentEvent.type == TouchEventType::Click) {
+                // A Click may drift up to 50 px before release: hit-test on the press point, or the
+                // tap lands on the neighbouring key/button (classic "pressed Q, got W" on the
+                // keyboard, whose keys are 47 px apart).
+                _currentEvent.x = _downX;
+                _currentEvent.y = _downY;
+            } else {
+                _currentEvent.x = _curX;
+                _currentEvent.y = _curY;
+            }
 
             ESP_LOGD(TAG, "Touch released at (%d, %d), type=%d, dur=%ums",
                      _curX, _curY, static_cast<int>(_currentEvent.type), (unsigned)dur);

@@ -4,6 +4,7 @@
 #include "mesh_service.h"
 #include "storage_manager.h"
 #include "views/view_alarm.h"
+#include "views/view_calc.h"
 #include "views/view_chat.h"
 #include "views/view_nodes.h"
 #include "views/view_map.h"
@@ -81,6 +82,7 @@ bool UIEngine::init() {
     _views.push_back(new ViewMap());      // View 2 (MAPPA)
     _views.push_back(new ViewSettings()); // View 3 (SET)
     _views.push_back(new ViewAlarm());    // View 4 (ALARM)
+    _views.push_back(new ViewCalc());     // View 5 (CALC)
 
     _currentViewIndex = 0;
     _views[_currentViewIndex]->onEnter();
@@ -146,6 +148,9 @@ void UIEngine::closeKeyboard() {
 
 void UIEngine::openQuickMenu() {
     if (_funcDrawerOpen) return; // the drawer owns the screen: no second overlay on top of it
+    // With the keyboard up the menu would sit over the key rows: its "nav bar" hit zone (y >= 730)
+    // covers SPACE/SEND (728..786), so a tap while typing would navigate to another view instead.
+    if (_keyboardOpen) return;
     _quickMenuOpen = true;
     EPDDriver::getInstance().setRefreshMode(RefreshMode::Grayscale);
     _needsFullRedraw = true;
@@ -186,8 +191,9 @@ void UIEngine::update() {
 
     // Update current active view. Skipped while the function drawer is up (the panel covers the
     // whole content area, and a view that repaints itself asynchronously (the map's settle pass)
-    // would otherwise draw over it) and while the alarm popup owns the screen.
-    if (!_funcDrawerOpen && !_alarmPopupOpen && _currentViewIndex >= 0 &&
+    // would otherwise draw over it), while the alarm popup owns the screen, and while the quick menu
+    // is open (same overlay-owns-the-panel rule: the map used to paint over the menu).
+    if (!_funcDrawerOpen && !_alarmPopupOpen && !_quickMenuOpen && _currentViewIndex >= 0 &&
         _currentViewIndex < (int)_views.size()) {
         _views[_currentViewIndex]->update();
     }
@@ -222,8 +228,9 @@ void UIEngine::update() {
     if (TouchManager::getInstance().hasEvent()) {
         TouchEvent ev = TouchManager::getInstance().popEvent();
 
-        // 0. The alarm popup is the topmost overlay: any tap stops the alarm.
-        if (_alarmPopupOpen) {
+        // 0. The alarm popup is the topmost overlay: any tap stops the alarm. _alarmPopupSwallow keeps
+        // consuming the rest of the gesture after the dismissal (see handleAlarmPopupTouch).
+        if (_alarmPopupOpen || _alarmPopupSwallow) {
             handleAlarmPopupTouch(ev);
             return;
         }
@@ -263,6 +270,14 @@ void UIEngine::update() {
         if (ev.type == TouchEventType::SwipeDown && ev.startY >= 0 && ev.startY < 44) {
             openQuickMenu();
             return;
+        }
+
+        // 4b. A Move of the gesture that opens the drawer/quick menu must not reach the view: the
+        // swipe would pan the map (or scroll a list) before the overlay came up.
+        if (ev.type == TouchEventType::Move) {
+            if ((ev.startY >= 730 && !_keyboardOpen) || ev.startY < 44) {
+                return;
+            }
         }
 
         // 5. If Keyboard is open, it handles touch
@@ -398,19 +413,25 @@ void UIEngine::drawStatusBar(M5GFX& gfx) {
     gfx.drawString(timeStr, 18, 25);
 
     // 2. LoRa RX/TX activity icon, next to the battery (replaces the "CH: N%" metric and the LORA box)
-    drawRadioActivityIcon(gfx, 366, 23);
+    drawRadioActivityIcon(gfx, 360, 23);
 
-    // 3. Notification Badge
+    // 3. Notification Badge - width follows the text: "[100]" in size 2 is 60 px and used to spill
+    // out of the fixed 42 px box.
     uint32_t unread = MeshService::getInstance().getUnreadCount();
     if (unread > 0) {
-        int badgeX = 265;
-        gfx.fillRoundRect(badgeX, 10, 42, 26, 4, TFT_BLACK);
+        int badgeX = 259;
+        char bStr[8];
+        if (unread > 99) {
+            snprintf(bStr, sizeof(bStr), "[99+]");
+        } else {
+            snprintf(bStr, sizeof(bStr), "[%u]", (unsigned)unread);
+        }
         gfx.setTextColor(TFT_WHITE, TFT_BLACK);
         gfx.setTextDatum(textdatum_t::middle_center);
         gfx.setTextSize(2);
-        char bStr[8];
-        snprintf(bStr, sizeof(bStr), "[%u]", (unsigned)unread);
-        gfx.drawString(bStr, badgeX + 21, 24);
+        const int badgeW = gfx.textWidth(bStr) + 10;
+        gfx.fillRoundRect(badgeX, 10, badgeW, 26, 4, TFT_BLACK);
+        gfx.drawString(bStr, badgeX + badgeW / 2, 24);
     }
 
     // 4. Battery State (Only icon with discrete ticks, NO percentage). A few px larger than before
@@ -420,7 +441,8 @@ void UIEngine::drawStatusBar(M5GFX& gfx) {
     // stealing space from the views. The cutoff itself lives in main.cpp.
     const bool lowBattery = !bat.isCharging && bat.voltageMv > 0 &&
                             bat.voltageMv <= BSP::LOW_BATTERY_WARN_MV;
-    int batX = 410;
+    int batX = 404;   // cluster shifted 6px left: battery terminal ends at x=466, flush with the
+                      // right edge of the list cards/bubbles (the clock on the left does not move)
     int batY = 10;
     int batW = 58;
     int batH = 26;
@@ -532,6 +554,17 @@ static void drawNavIcon(M5GFX& gfx, int index, int cx, int cy, uint16_t color, u
             gfx.fillCircle(cx + 10, cy - 9, 4, color);
             gfx.fillRect(cx - 14, cy + 13, 6, 3, color);
             gfx.fillRect(cx + 8, cy + 13, 6, 3, color);
+            break;
+        }
+        case 5: { // CALC: calculator body with screen and keys
+            gfx.drawRoundRect(cx - 14, cy - 17, 28, 34, 4, color);
+            gfx.drawRoundRect(cx - 13, cy - 16, 26, 32, 3, color);
+            gfx.fillRect(cx - 9, cy - 12, 18, 7, color);
+            for (int row = 0; row < 2; ++row) {
+                for (int col = 0; col < 3; ++col) {
+                    gfx.fillRect(cx - 10 + col * 8, cy + 1 + row * 7, 5, 4, color);
+                }
+            }
             break;
         }
     }
@@ -1297,9 +1330,17 @@ void UIEngine::drawAlarmPopup(M5GFX& gfx) {
 
 bool UIEngine::handleAlarmPopupTouch(const TouchEvent& ev) {
     // Any touch stops the alarm; the popup consumes everything while it is up.
-    if (ev.type == TouchEventType::Down || ev.type == TouchEventType::Click ||
-        ev.type == TouchEventType::Up) {
+    if (_alarmPopupOpen &&
+        (ev.type == TouchEventType::Down || ev.type == TouchEventType::Click ||
+         ev.type == TouchEventType::Up)) {
         AlarmService::getInstance().dismiss();
+    }
+    // The popup goes away on touch-DOWN, so the release of the same finger would fall through to the
+    // view underneath and open whatever sits under the tap. Swallow until the gesture ends.
+    if (ev.type == TouchEventType::Down) {
+        _alarmPopupSwallow = true;
+    } else if (ev.type == TouchEventType::Click || ev.type == TouchEventType::Up) {
+        _alarmPopupSwallow = false;
     }
     return true;
 }

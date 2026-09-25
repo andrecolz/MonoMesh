@@ -150,7 +150,9 @@ struct PendingRelay {
     uint8_t packet[256] = {0};
     size_t len = 0;
     uint32_t id = 0;
+    uint32_t from = 0;          // sender of the original frame: flood suppression matches (from,id)
     uint32_t transmitAtMillis = 0;
+    uint32_t queuedAtMillis = 0;
 };
 
 // One frame read out of the radio FIFO by the core-0 radio task and handed to the protocol code
@@ -175,7 +177,7 @@ public:
     void update();
 
     void sendAck(uint32_t toNode, uint32_t originalPacketId);
-    void markMessageAcked(uint32_t id);
+    void markMessageAcked(uint32_t id, uint32_t fromNode = 0);
     void markMessageFailed(uint32_t id, const char* reason);
 
     // Node Information
@@ -331,7 +333,8 @@ public:
     void setClockLandscape(bool en) { _clockLandscape = en; }
     bool getClockFlip180() const { return _clockFlip180; }
     void setClockFlip180(bool en) { _clockFlip180 = en; }
-    // Broadcast intervals (seconds). 0 = disabled where the periodic tick honours it.
+    // Broadcast intervals (seconds). 0 = disabled for position/NeighborInfo; NodeInfo and telemetry
+    // coerce 0 to their default interval (10800/1800) in the setters.
     uint32_t getNodeInfoIntervalSec() const { return _nodeInfoIntervalSec; }
     void setNodeInfoIntervalSec(uint32_t sec) { _nodeInfoIntervalSec = (sec == 0) ? 10800 : sec; }
     uint32_t getTelemetryIntervalSec() const { return _telemetryIntervalSec; }
@@ -377,7 +380,7 @@ public:
     void sortNodesByRecency();               // local node stays first, the rest by last heard
     static void radioTaskEntry(void* arg);   // core-0 RX pump (FIFO -> _rxQueue)
     void radioTaskLoop();
-    void requestNodeInfo(uint32_t nodeNum);
+    bool requestNodeInfo(uint32_t nodeNum);
     uint8_t getChannelHash() const;
     uint8_t getChannelHashFor(const char* name, const uint8_t* psk, uint8_t pskLen) const;
     // True when the given on-air hash belongs to one of our configured secondary channels, or to the
@@ -465,7 +468,7 @@ private:
         uint32_t lastMillis = 0;
     };
     static constexpr uint32_t NODEINFO_REQUEST_COOLDOWN_MS = 12UL * 3600UL * 1000UL;
-    NodeInfoRequest _nodeInfoRequests[16];
+    NodeInfoRequest _nodeInfoRequests[32];
     TaskHandle_t _radioTask = nullptr;
     QueueHandle_t _rxQueue = nullptr;
     SemaphoreHandle_t _radioMutex = nullptr;
@@ -538,7 +541,7 @@ private:
         char text[224] = "";       // full DM text: a 160 B field truncated the PKI retry copy
     };
     std::vector<DeferredSend> _deferredSends;
-    void queueDeferred(DeferredKind kind, uint32_t dest, uint32_t delayMs, uint32_t arg = 0, float snr = 0.0f);
+    bool queueDeferred(DeferredKind kind, uint32_t dest, uint32_t delayMs, uint32_t arg = 0, float snr = 0.0f);
     void queueDeferredDm(uint32_t dest, const char* text, uint32_t packetId, uint32_t delayMs);
     void processDeferredSends();
     void processAckQueue();
@@ -551,17 +554,20 @@ private:
     bool decryptPki(uint32_t fromNode, uint32_t packetId, const uint8_t* in, size_t inLen, uint8_t* out, size_t& outLen);
     bool encryptPki(uint32_t toNode, uint32_t packetId, const uint8_t* plain, size_t plainLen, uint8_t* out, size_t& outLen);
 
-    void sendNodeInfoTo(uint32_t dest, bool wantResponse, uint32_t requestId = 0);
+    bool sendNodeInfoTo(uint32_t dest, bool wantResponse, uint32_t requestId = 0);
     size_t buildNodeInfoPayload(uint8_t* out, size_t cap) const;
     bool sendDataPacket(uint32_t dest, uint32_t portnum, const uint8_t* payload, size_t payloadLen,
                         bool wantResponse, bool wantAck, bool allowPki, uint8_t* rawOut, size_t* rawLenOut,
                         uint32_t* packetIdOut, bool* usedPkiOut, uint32_t requestId = 0, uint32_t forcedId = 0,
-                        bool bypassDutyCycle = false);
+                        bool bypassDutyCycle = false, const uint8_t* forceKey = nullptr, uint8_t forceKeyLen = 0,
+                        int32_t forceChanHash = -1);
     void sendTelemetryTo(uint32_t dest, bool wantResponse = false, uint32_t requestId = 0);
     void handleNodeInfoRequest(uint32_t from, bool wantResponse, uint32_t requestId = 0);
     void handleTracerouteReceived(uint32_t from, uint32_t to, uint32_t id, const uint8_t* payload, size_t len,
-                                  bool isResponse, const uint8_t* chanKey, uint8_t chanKeyLen, float snr);
-    void sendTracerouteReply(uint32_t dest, uint32_t requestId, const uint8_t* payload, size_t len);
+                                  bool isResponse, const uint8_t* chanKey, uint8_t chanKeyLen, uint8_t chanHash,
+                                  float snr);
+    void sendTracerouteReply(uint32_t dest, uint32_t requestId, const uint8_t* payload, size_t len,
+                             const uint8_t* chanKey, uint8_t chanKeyLen, uint8_t chanHash);
     void applyModemPresetLocked(ModemPreset preset);
     bool applyRadioConfig();    // (re)programs frequency/power/preset under the mutex; false on timeout
     // wantResponse must stay false for replies: a unicast position reply that asks for a reply in turn
@@ -571,7 +577,7 @@ private:
                                 bool isResponse, bool appendId, uint32_t nodeId, float rxSnr);
     bool queueTracerouteRelay(uint8_t* rawPacket, size_t rawLen, uint32_t packetId, uint8_t hopLimit,
                               const uint8_t* key, uint8_t keyLen, const uint8_t* newPlain, size_t newPlainLen);
-    void cancelRelayFor(uint32_t id);
+    void cancelRelayFor(uint32_t id, uint32_t from = 0);
     // Rebroadcast policy gate (rebroadcastMode): used by both the decoded and the opaque relay paths.
     bool relayAllowedFor(uint32_t from) const;
     bool isPacketForUs(uint32_t to) const;
@@ -588,7 +594,9 @@ private:
         uint32_t id = 0;
         uint32_t timestamp = 0;
     };
-    static constexpr size_t SEEN_PACKETS_MAX = 64;
+    // 2-minute dedup window: 64 slots were overwritten long before the window expired on a busy
+    // mesh (> 64 frames in 2 min is plausible with multi-hop flooding), re-delivering duplicates.
+    static constexpr size_t SEEN_PACKETS_MAX = 128;
     SeenPacket _seenPackets[SEEN_PACKETS_MAX] = {};
     size_t _seenPacketIndex = 0;
     bool isPacketDuplicate(uint32_t from, uint32_t id);
@@ -603,7 +611,7 @@ private:
     void processPacket(uint8_t* payload, size_t len, float snr, float rssi);
     void handleDecryptedData(uint32_t from, uint32_t to, uint32_t id, const uint8_t* data, size_t len,
                              float snr, float rssi, bool wantAck, bool pkiDecoded,
-                             const uint8_t* chanKey, uint8_t chanKeyLen, uint8_t hopsTaken);
+                             const uint8_t* chanKey, uint8_t chanKeyLen, uint8_t chanHash, uint8_t hopsTaken);
     bool transmitRaw(const uint8_t* buf, size_t len, bool bypassDutyCycle = false);
     void updateNode(uint32_t nodeNum, const char* longName, const char* shortName, float snr, float rssi,
                     const uint8_t* pubKey = nullptr, uint8_t battery = 0, float voltage = 0.0f, int8_t role = -1,

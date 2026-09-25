@@ -77,13 +77,14 @@ private:
 
     // Function catalogue: order of the drawer cells (fixed), never reordered by usage. Names are
     // English; the ones that do not fit a 222 px cell get shortened.
-    static constexpr size_t NUM_APPS = 5;
+    static constexpr size_t NUM_APPS = 6;
     AppEntry _apps[NUM_APPS] = {
         { "CHAT", 0 },
         { "NODES", 1 },
         { "MAP", 2 },
         { "SETTINGS", 3 },
-        { "ALARM", 4 }
+        { "ALARM", 4 },
+        { "CALC", 5 }
     };
     int _navHistory[NUM_NAV_ITEMS] = { 0, 1, 2, 3 };
 
@@ -105,6 +106,7 @@ private:
     // Alarm popup: shown while an alarm rings in the normal UI (in standby/clock the alarm uses the
     // clock face + banner instead). It is the topmost overlay and owns every touch while it is up.
     bool _alarmPopupOpen = false;
+    bool _alarmPopupSwallow = false;   // swallow the rest of the gesture that dismissed the popup
 
     // Virtual Keyboard State
     enum class KeyShift : uint8_t { Off, Once, Lock };

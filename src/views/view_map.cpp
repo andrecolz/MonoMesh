@@ -475,7 +475,11 @@ bool ViewMap::loadSlot(int slot, int z, int x, int y) {
         uint16_t length = 0, flags = 0;
         if (!_pack.tileAt(x, y, offset, length, flags)) return false;   // no tile here
         if ((flags & 1) || length == 0) {                                // empty tile: no payload
-            s.state = _pack.blankIsBlack() ? SLOT_BLANK_BLACK : SLOT_BLANK_WHITE;
+            // Bit 1 of the flags carries the real fill colour (mono_map.py TILE_FLAG_BLANK_BLACK):
+            // a solid black tile in a light style (a lake at high zoom) must not be painted with the
+            // theme colour. Only tiles with no flag at all fall back to the style.
+            const bool black = (flags & 2) ? true : ((flags & 1) ? false : _pack.blankIsBlack());
+            s.state = black ? SLOT_BLANK_BLACK : SLOT_BLANK_WHITE;
             return true;
         }
         uint8_t* buf = (uint8_t*)heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -1356,6 +1360,23 @@ void ViewMap::drawActionButtons(lgfx::LGFXBase& gfx) {
     drawMapPin(gfx, FAB_X + FAB_W / 2, yPin + FAB_H / 2, localPosSet);
 }
 
+// Draws a string clipped to maxW px at the current text size, with "..." when it does not fit:
+// line1 with a 31-char long name is wider than the info card and was cut only by the screen edge.
+static void drawStringEllipsized(M5GFX& gfx, const char* text, int x, int y, int maxW) {
+    if (gfx.textWidth(text) <= maxW) {
+        gfx.drawString(text, x, y);
+        return;
+    }
+    char buf[96];
+    snprintf(buf, sizeof(buf), "%s", text);
+    size_t len = strlen(buf);
+    const int dotsW = gfx.textWidth("...");
+    while (len > 0 && gfx.textWidth(buf) + dotsW > maxW) buf[--len] = '\0';
+    while (len > 0 && buf[len - 1] == ' ') buf[--len] = '\0';
+    snprintf(buf + len, sizeof(buf) - len, "...");
+    gfx.drawString(buf, x, y);
+}
+
 void ViewMap::drawInfoCard(M5GFX& gfx) {
     const auto& nodes = MeshService::getInstance().getNodes();
     const MeshNode* sel = MeshService::getInstance().findNode(_selectedNodeNum);
@@ -1376,7 +1397,7 @@ void ViewMap::drawInfoCard(M5GFX& gfx) {
     char line1[96];
     snprintf(line1, sizeof(line1), "Node: %s (%s) | SNR: %.1f dB | RSSI: %.0f dBm",
              sel->shortName, sel->longName, sel->snr, sel->rssi);
-    gfx.drawString(line1, 22, CARD_Y + 20);
+    drawStringEllipsized(gfx, line1, 22, CARD_Y + 20, 440);
 
     // Second line: map credits instead of the node coordinates (asked for explicitly). The .mmap
     // container carries its own attribution; the PNG tree is the OSM "Toner" style.

@@ -14,6 +14,7 @@ import importlib.util
 import json
 import os
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -280,6 +281,26 @@ class TestCache(SyntheticFixture):
         self.assertFalse(fot.cache_is_stale(path, bbox))
         self.assertTrue(fot.cache_is_stale(path, (bbox[0] + 0.01, bbox[1], bbox[2], bbox[3])))
 
+    def test_cache_v2_is_accepted(self):
+        # The v2 layout is the current one minus the version bump (the bump only
+        # invalidates caches extracted with the broken water assembly): the
+        # reader must load a v2 file instead of raising "unsupported cache version".
+        bbox = self.info["bbox"]
+        path = os.path.join(self.tmp, "cache_v2.mosmb")
+        data = fot.extract_area_from_pbf(self.pbf, *bbox, cache_path=path, verbose=False)
+        with open(path, "rb") as f:
+            raw = bytearray(f.read())
+        struct.pack_into("<I", raw, len(fot.CACHE_MAGIC), 2)      # versione 2
+        v2_path = os.path.join(self.tmp, "cache_v2_only.mosmb")
+        with open(v2_path, "wb") as f:
+            f.write(raw)
+        loaded = fot.cache_read(v2_path)
+        self.assertEqual(loaded.n_ways, data.n_ways)
+        self.assertEqual(loaded.n_places, data.n_places)
+        self.assertEqual(loaded.place_names, data.place_names)
+        self.assertEqual(list(loaded.place_population), list(data.place_population))
+        self.assertEqual(loaded.to_legacy_dict(), data.to_legacy_dict())
+
 
 class TestOpenWaterRings(unittest.TestCase):
     """Water multipolygons truncated by the extracted area.
@@ -543,6 +564,10 @@ class TestPipeline(SyntheticFixture):
                                            cache_dir=cache_dir, verbose=False)
         self.assertEqual(res2["rendered"], 0)
         self.assertEqual(res2["skipped"], res["rendered"])
+        # the "nothing to render" return must carry the same keys as the others
+        for key in ("mmap", "stats", "jobs", "pipeline_seconds",
+                    "extract_seconds", "index_seconds"):
+            self.assertIn(key, res2)
 
     def test_png_modes(self):
         bbox = self.info["bbox"]
@@ -580,24 +605,36 @@ class TestPipeline(SyntheticFixture):
         """A run that dies mid-render must not leave a payload temp behind.
 
         The old code left multi-hundred-MB .mmap-payload-*.tmp files next to the
-        maps after every crash.
+        maps after every crash. The container output is the one under test: the
+        PNG path never opens the payload temp at all.
         """
         bbox = self.info["bbox"]
         out = os.path.join(self.tmp, "tiles_fail")
         cache_dir = os.path.join(self.tmp, "cache_fail")
         original = fot._render_one
+        original_writer = fot.MapWriter
+        temps = []
+
+        class RecordingWriter(original_writer):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                temps.append(self._tmp.name)
 
         def boom(_task):
             raise RuntimeError("simulated render failure")
 
         fot._render_one = boom
+        fot.MapWriter = RecordingWriter
         try:
             with self.assertRaises(RuntimeError):
                 fot.generate_tiles_from_pbf(self.pbf, *bbox, [13], output_dir=out,
                                             area_name="synth_fail", force=True, jobs=1,
-                                            cache_dir=cache_dir, verbose=False)
+                                            cache_dir=cache_dir, verbose=False,
+                                            out_format="mmap")
         finally:
             fot._render_one = original
+            fot.MapWriter = original_writer
+        self.assertTrue(temps, "il test deve esercitare MapWriter (serve out_format='mmap')")
         leftovers = [f for f in os.listdir(out) if f.startswith(".mmap-payload")]
         self.assertEqual(leftovers, [], f"temp rimasti: {leftovers}")
 

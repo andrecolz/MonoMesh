@@ -265,14 +265,18 @@ void ViewSettings::update() {
 
 bool ViewSettings::scrollPage(int8_t direction) {
     if (_modal != Modal::None) return false; // the modal owns the screen
-    if (direction < 0) {
-        if (_page == Page::Root) return false;
-        gotoPage(Page::Root);
-        return true;
-    }
+    if (direction == 0) return false;
+    // One category at a time, no wrap-around like the chat/node/alarm lists: at the edges the
+    // click is consumed. -1 from SYSTEM falls back to the category list (the back gesture's target).
     const int last = (int)Page::Count - 1;
     int p = (int)_page;
-    p = (p == 0) ? 1 : (p % last) + 1;
+    if (direction > 0) {
+        if (p >= last) return true;
+        ++p;
+    } else {
+        if (p <= 0) return true;
+        --p;
+    }
     gotoPage((Page)p);
     return true;
 }
@@ -1122,7 +1126,7 @@ bool ViewSettings::handleChannelsTouch(const TouchEvent& ev) {
             const uint8_t* k = ms.getPrimaryChannelPsk();
             for (uint8_t i = 0; i < ms.getPrimaryChannelPskLen(); ++i) snprintf(curHex + i * 2, 3, "%02x", k[i]);
         }
-        UIEngine::getInstance().openKeyboard(curHex, [](const std::string& hex) {
+        UIEngine::getInstance().openKeyboard(curHex, [this](const std::string& hex) {
             uint8_t key[32] = {0};
             uint8_t keyLen = 0;
             bool valid = true;
@@ -1140,6 +1144,12 @@ bool ViewSettings::handleChannelsTouch(const TouchEvent& ev) {
                     MeshService::getInstance().setPrimaryChannelPsk(key, keyLen);
                 } else {
                     ESP_LOGW(TAG, "Invalid PSK: 32 or 64 hex characters required");
+                    // A silent discard looked like a successful save (the row just redrew the old
+                    // value): say why nothing changed and that empty input is the factory key.
+                    _confirmTarget = ConfirmTarget::None;
+                    _confirmTitle = "INVALID PSK";
+                    _confirmMsg = "32/64 HEX CHARS REQUIRED\nEMPTY = DEFAULT KEY";
+                    _modal = Modal::Confirm;
                 }
             }
             MeshService::getInstance().saveConfig();
