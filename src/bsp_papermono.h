@@ -124,13 +124,16 @@ public:
     // clock-only mode can use longer slices because nothing but the minute change and the buttons
     // depends on the wake period. buttonWake adds the two user buttons as a GPIO wake source for that
     // sleep (timer + buttons): used by the clock modes so a short tap is not lost between the
-    // minute-aligned slices. DIO1 is never armed this way.
+    // minute-aligned slices. pm1Wake adds the PM1 IRQ line (power button): without it a press during
+    // a minute-long clock slice is only serviced at the next timer wake, and the PM1 latch it leaves
+    // behind is consumed by the status cleanup below before the app can see it. DIO1 is never armed.
     static constexpr uint32_t STANDBY_SLEEP_MS = 100;
     // Cap of ClockMode::msToNextMinute(): the clock face only shows HH:MM, so the mode sleeps all the
     // way to the next minute boundary (the old 1 s cap meant 60 wake-ups per minute, each one paying
     // a full I2C poll round for nothing).
     static constexpr uint32_t CLOCK_SLEEP_MS = 60000;
-    esp_sleep_wakeup_cause_t lowPowerLightSleep(uint32_t maxSleepMs, bool buttonWake = false);
+    esp_sleep_wakeup_cause_t lowPowerLightSleep(uint32_t maxSleepMs, bool buttonWake = false,
+                                                bool pm1Wake = false);
     // True while a notification beep or an LED activity pulse is still running: light sleep does not
     // stop the LEDC timer, so without this the beep/LED outlived its configured duration.
     bool hasPendingActivity() const { return _buzzerActive || _ledOffUntil > 0; }
@@ -230,10 +233,16 @@ private:
     // Waits for the RX8130 /IRQ line to be released (high) before arming the PM1 wake: an asserted
     // line would power the board straight back on right after shutdown.
     bool waitRtcWakeLineIdle();
-    // GPIO wake on the two user buttons for the clock-mode light sleep: the level-triggered sources
-    // are disarmed right after the wake, before anything else can spin on them.
-    void armButtonWake();
-    void disarmButtonWake();
+    // GPIO wake on the two user buttons (and optionally the PM1 IRQ line) for the clock-mode light
+    // sleep: the level-triggered sources are disarmed right after the wake, before anything else can
+    // spin on them. includePm1Irq must be the same value given to armButtonWake().
+    void armButtonWake(bool includePm1Irq = false);
+    void disarmButtonWake(bool includePm1Irq = false);
+    // True when the PM1 IRQ line is released and safe to arm as a level wake. If the line is still
+    // asserted, drain the PM1 statuses first (the button "wake event" bit outlives M5Unified's
+    // click read and would make every armed sleep return at once); a real button flag found while
+    // draining is latched in _pm1BtnLatch so the wake loop can still consume it.
+    bool pm1IrqIsIdle();
 
     M5PM1 _pm1;
     M5IOE1 _ioe1;
@@ -253,6 +262,10 @@ private:
     bool _buzzerActive = false;
     uint16_t _buzzerFreq = 2700; // last LEDC frequency programmed (skip redundant timer reconfig)
     uint32_t _lowPowerStartMillis = 0;
+    // Power-button flag captured while the CPU slept (lowPowerLightSleep() must drain the PM1
+    // latch to release the IRQ line, but in the clock modes that press is the only exit): kept
+    // here so checkPowerButton() can still consume it as a wake request.
+    bool _pm1BtnLatch = false;
     bool _bootFromRtcAlarm = false; // PM1 G0 wake latched at init (RTC alarm power-on)
     int8_t _tzOffset = 1;   // hours east of UTC (Italy: +1 winter, +2 summer)
 };

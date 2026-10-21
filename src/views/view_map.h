@@ -2,6 +2,7 @@
 
 #include "view_base.h"
 #include "../map_pack.h"
+#include "../map_vector.h"
 #include <M5GFX.h>
 #include <string>
 #include <vector>
@@ -89,10 +90,20 @@ private:
         uint8_t overzoom = 0;    // SLOT_OVERZOOM: 2^overzoom = scale (parent -> child)
         uint8_t srcBits = 1;     // SLOT_OVERZOOM: packed bits of the parent tile
         uint16_t srcPx = 0;      // SLOT_OVERZOOM: parent tile size in pixels
+        bool fromBasemap = false; // pixels come from the global basemap: base style (25% grey)
     };
 
     // ---- region / container ----
     MapPack _pack;
+    // Vector container (.mmap v2, plan Piano B): rendered on device by the
+    // shared libmapcore rasteriser instead of blitting pre-rendered tiles.
+    // Raster v1 containers and the basemap keep using MapPack unchanged.
+    MapVector _vector;
+    // Plan D5 label layout cache: the accepted set is world anchored, so a
+    // strip repaint inside the slack redraws it without touching the POI
+    // sections; full renders rebuild it with identical placement rules.
+    mm_label_cache _labelCache = {};
+    bool _useVector = false;
     // Global z0-7 courtesy basemap (optional): the fallback for areas no region
     // covers, opened on its own so it never disturbs the region selection.
     MapPack _basemap;
@@ -107,6 +118,8 @@ private:
     // ---- composition buffer ----
     M5Canvas _canvas{&M5.Display};
     bool _canvasReady = false;
+    // Fill/label workspace for the vector rasteriser (plan D6 arena row).
+    uint8_t* _vecScratch = nullptr;
 
     double _centerLat = 45.4642; // only until a real position (or the tile area) is known
     double _centerLon = 9.1900;
@@ -123,6 +136,10 @@ private:
 
     bool _dirtyFast = false;     // the map area needs a 1-bit refresh
     bool _needsSettle = false;   // the map area needs the grayscale "finishing" pass
+    // The composed canvas was pushed into the panel buffer and nothing redrew
+    // it since: the settle pass can reuse the panel buffer and skip the whole
+    // composition (one full vector render per pan/zoom was pure waste).
+    bool _canvasPushed = false;
     uint32_t _lastMoveMs = 0;
     uint32_t _settleMs = SETTLE_MS;
     uint32_t _lastSaveMs = 0;
@@ -143,9 +160,15 @@ private:
     bool ensureCanvas();
     void releaseCanvas();
     void composeScene(int x0, int y0, int x1, int y1);
+    // Vector path: draws the map layers + labels into the canvas clip rect with
+    // the shared libmapcore rasteriser (strip repaints are just narrow clips).
+    void composeVectorScene(int x0, int y0, int x1, int y1);
     void publishRect(int canvasY0, int canvasY1, bool grayscale);
     void scrollCanvas(int dx, int dy);
     void renderFull(bool grayscale);
+    // Grayscale "settling" pass: reuses the panel buffer when the canvas has
+    // not changed since the fast pass, recomposes only when it must.
+    void settleGrayscale();
     void toast(const char* fmt, ...);
     // Called by StorageManager right before the FAT is unmounted (standby, power off):
     // the container file must not stay open across SD_MMC.end(). Public because the
@@ -157,7 +180,10 @@ private:
 
     void drawHeader(M5GFX& gfx);
     void drawGrid(bool withCrosshair);
-    void drawScaleBar();
+    // Screen-fixed UI (scale bar, action buttons, toast): drawn on the display
+    // after every canvas push, never inside the scrollable canvas.
+    void drawFixedOverlays(M5GFX& gfx);
+    void drawScaleBar(lgfx::LGFXBase& gfx);
     void drawNodes(double latRad, double mpp);
     void drawWaypoints(double latRad, double mpp);
     void drawInfoCard(M5GFX& gfx);
@@ -179,6 +205,20 @@ private:
     void openBasemap();
     bool loadOverzoom(int slot, MapPack& pack, bool primary, int z, int x, int y,
                       int maxLevels);
+    // Small ring cache for the parent lookups of loadOverzoom: panning along a
+    // coverage edge asks the same parent tile for several neighbouring children,
+    // and a hit skips the presence-row reads on the SD.  Single-threaded view.
+    struct ParentHit {
+        int z = -1, x = 0, y = 0;
+        bool present = false;
+        uint32_t offset = 0;
+        uint16_t length = 0, flags = 0;
+    };
+    ParentHit _parentHits[8];
+    uint8_t _parentHitNext = 0;
+    bool tileAtZoomCached(int z, int x, int y, uint32_t& offset, uint16_t& length,
+                          uint16_t& flags);
+    void clearParentHits();
 
     // Web Mercator helpers (same scheme as /tiles/z/x/y.png)
     static void latLonToTile(double lat, double lon, int z, double& tx, double& ty);

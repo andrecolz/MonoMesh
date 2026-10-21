@@ -27,12 +27,27 @@ log_serial.txt
 monomesh_serial.log
 
 # --- Toolchain e binari nativi ---
-tools/.toolchain/
-tools/native/
-tools/auto_flash_and_monitor.py
-tools/native/monomesh-tiles
-tools/native/.zig-cache/
-tools/tests/test_native.py
+# I sorgenti nativi servono alla build e ai test in CI: si versionano.
+# Binari, cache del compilatore e toolchain restano locali.
+/tools/.toolchain/
+/tools/native/*
+!/tools/native/*.c
+!/tools/native/*.h
+!/tools/native/*.sh
+!/tools/native/*.py
+!/tools/native/README.md
+!/tools/native/libmapcore/
+!/tools/native/libmapcore/**
+# Di zlib serve solo il codice compilato dalla build, non contrib/doc
+!/tools/native/third_party/
+!/tools/native/third_party/zlib/
+/tools/native/third_party/zlib/*
+!/tools/native/third_party/zlib/*.c
+!/tools/native/third_party/zlib/*.h
+!/tools/native/third_party/zlib/LICENSE
+/tools/native/.zig-cache/
+/tools/auto_flash_and_monitor.py
+/tools/tests/test_native.py
 
 # --- Riferimenti e materiale di terzi (solo in locale) ---
 reference/

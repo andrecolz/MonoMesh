@@ -141,6 +141,12 @@ void ViewMap::releaseSdHandles() {
     _usePack = false;
     _basemap.close();
     _useBasemap = false;
+    // The vector container holds an SD_MMC File too: leaving it open across
+    // SD_MMC.end() kept a dangling handle until the next openRegion().
+    _vector.close();
+    _useVector = false;
+    mm_label_cache_reset(&_labelCache);
+    _canvasPushed = false;
     invalidateTileCache();
     // Force the next update() through the "card changed" path, which re-scans and
     // reopens the container once the card is mounted again after the wake.
@@ -152,6 +158,11 @@ ViewMap::~ViewMap() {
     releaseCanvas();
     _pack.close();
     _basemap.close();
+    _vector.close();
+    if (_vecScratch) {
+        free(_vecScratch);
+        _vecScratch = nullptr;
+    }
     for (auto& slot : _tileCache) {
         if (slot.data) free(slot.data);
         slot.data = nullptr;
@@ -183,6 +194,7 @@ void ViewMap::releaseCanvas() {
         _canvas.deleteSprite();
         _canvasReady = false;
     }
+    _canvasPushed = false;
 }
 
 void ViewMap::toast(const char* fmt, ...) {
@@ -213,6 +225,8 @@ void ViewMap::onEnter() {
             if (_regionIndex >= _regions.size()) _regionIndex = 0;
             if (!openRegion(_regionIndex, false)) scanZooms();   // broken container: PNG fallback
         } else {
+            _vector.close();
+            _useVector = false;
             _pack.close();
             _usePack = false;
             scanZooms();
@@ -299,6 +313,8 @@ void ViewMap::update() {
             if (_regionIndex >= _regions.size()) _regionIndex = 0;
             if (!openRegion(_regionIndex, false)) scanZooms();  // broken container: PNG fallback
         } else {
+            _vector.close();
+            _useVector = false;
             _pack.close();
             _usePack = false;
             scanZooms();
@@ -324,10 +340,27 @@ void ViewMap::update() {
     // and a little longer after a button zoom, so stepping 15 -> 12 does not trigger a refresh (and
     // its flash) between two clicks.
     if (_needsSettle && (uint32_t)(millis() - _lastMoveMs) >= _settleMs) {
-        renderFull(true);
+        settleGrayscale();
         _needsSettle = false;
         saveView(false);
     }
+}
+
+// The fast pass pushed the composed canvas into the panel buffer; the settle
+// pass only needs the 4-level waveform on that same buffer.  Re-running the
+// whole composition (vector layers + labels) for a scene that did not change
+// was doubling the cost of every pan and every zoom step.  If something did
+// change the canvas since the push, fall back to the full grayscale render.
+void ViewMap::settleGrayscale() {
+    if (!_canvasReady) return;
+    if (!_canvasPushed) {
+        renderFull(true);
+        return;
+    }
+    // The info card is outside the canvas and carries live radio metrics: it
+    // used to be refreshed by the settle recompose, so refresh it here too.
+    drawInfoCard(M5.Display);
+    EPDDriver::getInstance().flushRectGrayscale(0, MAP_VIEW_Y, 480, MAP_BOTTOM - MAP_VIEW_Y + 1);
 }
 
 void ViewMap::requestFastRedraw(uint32_t settleMs) {
@@ -347,6 +380,8 @@ void ViewMap::publishRect(int canvasY0, int canvasY1, bool grayscale) {
     const uint8_t* buf = (const uint8_t*)_canvas.getBuffer() + (size_t)canvasY0 * 480;
     M5.Display.pushImage(0, MAP_TOP + canvasY0, 480, canvasY1 - canvasY0,
                          (const lgfx::grayscale_t*)buf);
+    _canvasPushed = true;
+    drawFixedOverlays(M5.Display);   // screen-fixed UI stays put across pans
     if (grayscale) {
         EPDDriver::getInstance().flushRectGrayscale(0, MAP_TOP + canvasY0, 480, canvasY1 - canvasY0);
     } else {
@@ -386,6 +421,8 @@ void ViewMap::renderFull(bool grayscale) {
     drawHeader(M5.Display);
     composeScene(0, 0, 480, CV_H);
     M5.Display.pushImage(0, MAP_TOP, 480, CV_H, (const lgfx::grayscale_t*)_canvas.getBuffer());
+    _canvasPushed = true;
+    drawFixedOverlays(M5.Display);
     drawInfoCard(M5.Display); // below the map area, outside the canvas
     // The header carries the zoom level, so it is repainted together with the map and both go out in
     // the same panel update: 44..729, the status bar above stays untouched.
@@ -411,6 +448,31 @@ void ViewMap::scanRegions() {
 bool ViewMap::openRegion(size_t index, bool announce) {
     if (index >= _regions.size()) return false;
     _regionIndex = index;
+    mm_label_cache_reset(&_labelCache); // another container: no stale labels
+
+    // Vector container (.mmap v2) first: rendered on device by libmapcore. A
+    // raster v1 container falls through to MapPack unchanged.
+    _vector.close();
+    _useVector = false;
+    if (_vector.open(_regions[index].c_str())) {
+        _zooms.clear();
+        for (int z = _vector.zmin(); z <= _vector.zmax(); ++z) {
+            if (z >= ZOOM_MIN && z <= ZOOM_MAX) _zooms.push_back(z);
+        }
+        if (!_zooms.empty()) {
+            _useVector = true;
+            _usePack = false;
+            invalidateTileCache();
+            if (announce) {
+                toast("Map: %s (Z %d-%d)", _vector.name(), _zooms.front(), _zooms.back());
+            }
+            ESP_LOGI("ViewMap", "active vector container: %s", _regions[index].c_str());
+            return true;
+        }
+        ESP_LOGW("ViewMap", "%s: no usable zoom range", _regions[index].c_str());
+        _vector.close();
+    }
+
     if (_pack.open(_regions[index].c_str()) && _pack.tilePx() == TILE_PX) {
         _zooms.clear();
         for (size_t i = 0; i < _pack.zoomCount(); ++i) {
@@ -455,6 +517,20 @@ bool ViewMap::openRegion(size_t index, bool announce) {
 }
 
 bool ViewMap::centerOnPack() {
+    if (_useVector) {
+        // Vector container: centre on the covered bbox at a mid zoom.
+        const mm_vmap* m = _vector.map();
+        // untrusted header: clamp before the degrees reach the Mercator math
+        double lat = (m->bbox_e7[0] + m->bbox_e7[2]) / 2.0 / 1e7;
+        double lon = (m->bbox_e7[1] + m->bbox_e7[3]) / 2.0 / 1e7;
+        _centerLat = std::max(-85.0, std::min(85.0, lat));
+        _centerLon = std::max(-180.0, std::min(180.0, lon));
+        _zoomLevel = _zooms.empty() ? _vector.zmin() : _zooms[_zooms.size() / 2];
+        _selectedNodeNum = 0;
+        ESP_LOGI("ViewMap", "centred on vector container: %.5f, %.5f (Z%d)", _centerLat,
+                 _centerLon, _zoomLevel);
+        return true;
+    }
     if (!_usePack) return false;
     const int z = _zooms.empty() ? _pack.firstZoom() : _zooms.front();
     if (!_pack.selectZoom(z)) return false;
@@ -531,6 +607,7 @@ bool ViewMap::loadSlot(int slot, int z, int x, int y) {
             uint32_t offset = 0;
             uint16_t length = 0, flags = 0;
             if (_pack.tileAt(x, y, offset, length, flags)) {
+                s.fromBasemap = false;
                 if ((flags & 1) || length == 0) {                        // empty tile: no payload
                     // The slot keeps the *content* colour (mono_map.py TILE_FLAG_BLANK_BLACK is a
                     // solid black tile, e.g. a lake); blitSlot inverts it when the dark theme is on.
@@ -628,18 +705,23 @@ void ViewMap::openBasemap() {
 bool ViewMap::loadOverzoom(int slot, MapPack& pack, bool primary, int z, int x, int y,
                            int maxLevels) {
     TileSlot& s = _tileCache[slot];
-    for (int k = 1; k <= maxLevels && z - k >= ZOOM_MIN; ++k) {
+    // The basemap has native tiles at its own levels: k=0 must be tried there
+    // (for the region, k=0 is the caller's own tileAt()).
+    const int kFirst = primary ? 1 : 0;
+    for (int k = kFirst; k <= maxLevels && z - k >= ZOOM_MIN; ++k) {
         const int pz = z - k;
         const int px = x >> k, py = y >> k;
         uint32_t offset = 0;
         uint16_t length = 0, flags = 0;
         const bool present = primary
-            ? _pack.tileAtZoom(pz, px, py, offset, length, flags)
+            ? tileAtZoomCached(pz, px, py, offset, length, flags)
             : (pack.selectZoom(pz) && pack.tileAt(px, py, offset, length, flags));
         if (!present) continue;
         if ((flags & 1) || length == 0) {
-            // A blank parent overzooms to a solid child of the same colour.
+            // A blank parent overzooms to a solid child of the same colour; a
+            // blank basemap tile keeps the base style (see blitSlot).
             s.state = (flags & 2) ? SLOT_BLANK_BLACK : SLOT_BLANK_WHITE;
+            s.fromBasemap = !primary;
             return true;
         }
         const uint8_t bits = primary ? _pack.zoomBits(pz) : pack.selectedBits();
@@ -662,6 +744,7 @@ bool ViewMap::loadOverzoom(int slot, MapPack& pack, bool primary, int z, int x, 
         s.overzoom = (uint8_t)k;
         s.srcBits = bits;
         s.srcPx = (uint16_t)srcPx;
+        s.fromBasemap = !primary;
         return true;
     }
     return false;
@@ -719,7 +802,24 @@ void ViewMap::blitSlot(int slot, int canvasX, int canvasY) {
             uint8_t* buf = (uint8_t*)_canvas.getBuffer();
             const int qx = (s.x & (scale - 1)) * (srcPx / scale);
             const int qy = (s.y & (scale - 1)) * (srcPx / scale);
-            if (s.srcBits == 1) {
+            if (s.fromBasemap && s.srcBits == 1) {
+                // Base style: black content stays solid, white content becomes a
+                // 25% dot pattern phase-locked to the screen (no seams between
+                // tiles); the dark theme flips ink and background together.
+                const uint8_t ink = dark ? 255 : 0;
+                const uint8_t bg = dark ? 0 : 255;
+                for (int y = dy0; y < dy1; ++y) {
+                    const int sy = qy + (y - canvasY) / scale;
+                    const uint8_t* src = s.data + (size_t)sy * srcRowBytes;
+                    uint8_t* dst = buf + (size_t)y * 480;
+                    const bool dot_row = (y & 1) == 0;
+                    for (int x = dx0; x < dx1; ++x) {
+                        const int sx = qx + (x - canvasX) / scale;
+                        const bool white = (src[sx >> 3] >> (7 - (sx & 7))) & 1;
+                        dst[x] = (white && !(dot_row && (x & 1) == 0)) ? bg : ink;
+                    }
+                }
+            } else if (s.srcBits == 1) {
                 const uint8_t* lut = expandTable1(dark);
                 for (int y = dy0; y < dy1; ++y) {
                     const int sy = qy + (y - canvasY) / scale;
@@ -761,6 +861,23 @@ void ViewMap::blitSlot(int slot, int canvasX, int canvasY) {
             }
             break;
         case SLOT_BLANK_WHITE:
+            if (s.fromBasemap) {
+                // All-land basemap tile: the same 25% base pattern, screen-aligned.
+                const uint8_t ink = dark ? 255 : 0;
+                const uint8_t bg = dark ? 0 : 255;
+                const int bx0 = std::max(0, canvasX), bx1 = std::min(480, canvasX + TILE_PX);
+                const int by0 = std::max(0, canvasY), by1 = std::min(CV_H, canvasY + TILE_PX);
+                if (bx0 >= bx1 || by0 >= by1) return;
+                uint8_t* buf = (uint8_t*)_canvas.getBuffer();
+                for (int y = by0; y < by1; ++y) {
+                    uint8_t* dst = buf + (size_t)y * 480;
+                    const bool dot_row = (y & 1) == 0;
+                    for (int x = bx0; x < bx1; ++x) {
+                        dst[x] = (dot_row && (x & 1) == 0) ? ink : bg;
+                    }
+                }
+                break;
+            }
             // The slot holds the content colour; the dark theme inverts the panel.
             _canvas.fillRect(canvasX, canvasY, TILE_PX, TILE_PX, dark ? TFT_BLACK : TFT_WHITE);
             break;
@@ -770,6 +887,38 @@ void ViewMap::blitSlot(int slot, int canvasX, int canvasY) {
         default:
             break;
     }
+}
+
+void ViewMap::clearParentHits() {
+    for (auto& hit : _parentHits) {
+        hit.z = -1;
+        hit.present = false;
+    }
+    _parentHitNext = 0;
+}
+
+bool ViewMap::tileAtZoomCached(int z, int x, int y, uint32_t& offset, uint16_t& length,
+                               uint16_t& flags) {
+    for (const auto& hit : _parentHits) {
+        if (hit.z == z && hit.x == x && hit.y == y) {
+            offset = hit.offset;
+            length = hit.length;
+            flags = hit.flags;
+            return hit.present;
+        }
+    }
+    const bool present = _pack.tileAtZoom(z, x, y, offset, length, flags);
+    ParentHit& hit = _parentHits[_parentHitNext];
+    _parentHitNext = (uint8_t)((_parentHitNext + 1) %
+                               (sizeof(_parentHits) / sizeof(_parentHits[0])));
+    hit.z = z;
+    hit.x = x;
+    hit.y = y;
+    hit.present = present;
+    hit.offset = present ? offset : 0;
+    hit.length = present ? length : 0;
+    hit.flags = present ? flags : 0;
+    return present;
 }
 
 void ViewMap::invalidateTileCache() {
@@ -782,6 +931,7 @@ void ViewMap::invalidateTileCache() {
         slot.lastUse = 0;
     }
     _tileUseCounter = 0;
+    clearParentHits();   // parent lookups belong to the container just dropped
 }
 
 void ViewMap::scanZooms() {
@@ -850,7 +1000,7 @@ bool ViewMap::ensureZoomAvailable() {
 }
 
 bool ViewMap::centerOnAvailableTiles() {
-    if (_usePack) return centerOnPack();
+    if (_usePack || _useVector) return centerOnPack();
     if (_zooms.empty()) return false;
 
     // Lowest level = widest coverage and by far the fewest tiles, so it can be scanned in full.
@@ -1026,6 +1176,11 @@ bool ViewMap::parseTileFileName(const char* name, int& out) {
 
 bool ViewMap::tileExistsAt(int z, double lat, double lon) {
     if (z < ZOOM_MIN || z > ZOOM_MAX) return false;
+    if (_useVector) {
+        // Vector bands cover the container bbox at every served zoom: the zoom
+        // snap only needs the level to be in the band range.
+        return z >= _vector.zmin() && z <= _vector.zmax();
+    }
     double tx = 0, ty = 0;
     latLonToTile(lat, lon, z, tx, ty);
     const int xi = (int)floor(tx);
@@ -1144,6 +1299,7 @@ void ViewMap::panBy(int dx, int dy) {
         const int y1 = dy > 0 ? ah : CV_H;
         composeScene(0, y0, 480, y1);
     }
+    const uint32_t composeMs = millis() - tPan;
     // The whole viewport must be republished. The e-paper keeps the image it was
     // given, it does not scroll its own glass: after a pan every pixel of the map
     // sits somewhere else, so updating only the newly exposed strip would leave the
@@ -1151,14 +1307,32 @@ void ViewMap::panBy(int dx, int dy) {
     // appeared while dragging). Partial publishes stay valid for UI updates where the
     // untouched part really does not change.
     publishRect(0, CV_H, false);
+    const uint32_t totalMs = millis() - tPan;
     _lastMoveMs = millis();
     _needsSettle = true;
     _settleMs = SETTLE_MS; // a pan settles after 1 s (a button zoom keeps its longer debounce)
     if (logPan) {
         _lastPanLogMs = millis();
-        ESP_LOGI("ViewMap", "pan %d,%d: %u tiles read, refresh 480x%d, %u ms",
-                 dx, dy, (unsigned)(_statTileReads - readsBefore), CV_H,
-                 (unsigned)(millis() - tPan));
+        ESP_LOGI("ViewMap", "pan %d,%d: compose %u ms, publish %u ms, %u tiles read, %u ms total",
+                 dx, dy, (unsigned)composeMs, (unsigned)(totalMs - composeMs),
+                 (unsigned)(_statTileReads - readsBefore), (unsigned)totalMs);
+    }
+}
+
+// Screen-fixed UI: scale bar, action buttons and the toast.  These are drawn
+// on the display after every canvas push, so they never scroll with the map
+// and a strip repaint does not have to recompose them (the old bug and the
+// three extra vector walks per pan).  Coordinates are display coordinates.
+void ViewMap::drawFixedOverlays(M5GFX& gfx) {
+    drawScaleBar(gfx);
+    drawActionButtons(gfx);
+    if (_toastUntilMs && (int32_t)(millis() - _toastUntilMs) < 0) {
+        gfx.setTextDatum(textdatum_t::top_left);
+        gfx.setTextSize(1);
+        gfx.fillRect(6, MAP_TOP + 6, 320, 18, TFT_WHITE);
+        gfx.drawRect(6, MAP_TOP + 6, 320, 18, TFT_BLACK);
+        gfx.setTextColor(TFT_BLACK, TFT_WHITE);
+        gfx.drawString(_toast, 12, MAP_TOP + 9);
     }
 }
 
@@ -1166,6 +1340,9 @@ void ViewMap::panBy(int dx, int dy) {
 
 void ViewMap::composeScene(int x0, int y0, int x1, int y1) {
     if (!_canvasReady) return;
+    // Any composition invalidates the "panel buffer matches the canvas"
+    // assumption until the caller pushes the result (see _canvasPushed).
+    _canvasPushed = false;
     x0 = std::max(0, x0);
     y0 = std::max(0, y0);
     x1 = std::min(480, x1);
@@ -1197,6 +1374,12 @@ void ViewMap::composeScene(int x0, int y0, int x1, int y1) {
     const int ty1 = (int)floor(tileY + (double)(MAP_TILE_BOTTOM - MAP_CY) / TILE_SIZE);
 
     int drawn = 0;
+    if (_useVector) {
+        // Vector bands: the shared rasteriser draws layers + labels straight
+        // into the clip rect (strip repaints after a pan are cheap by design).
+        composeVectorScene(x0, y0, x1, y1);
+        drawn = 1;  // the bands cover the region: no "no map here" hint
+    } else {
     for (int ty = ty0; ty <= ty1; ++ty) {
         if (ty < 0 || ty >= maxTile) continue;
         for (int tx = tx0; tx <= tx1; ++tx) {
@@ -1210,11 +1393,12 @@ void ViewMap::composeScene(int x0, int y0, int x1, int y1) {
             ++drawn;
         }
     }
+    }
 
-    drawScaleBar();
+    // The scale bar and the action buttons are screen fixed and live on the
+    // display (drawFixedOverlays), not in this scrollable canvas.
     drawNodes(latRad, mpp);
     drawWaypoints(latRad, mpp);
-    drawActionButtons(_canvas);
 
     // Hint when there is really nothing to show. Only painted on a full compose: a
     // strip repaint must not re-draw a message that belongs to a different area.
@@ -1237,19 +1421,92 @@ void ViewMap::composeScene(int x0, int y0, int x1, int y1) {
         _canvas.setTextSize(1);
         _canvas.drawString(hint, MAP_CX, 6);
     }
-    if (_toastUntilMs && (int32_t)(millis() - _toastUntilMs) < 0) {
-        _canvas.setTextDatum(textdatum_t::top_left);
-        _canvas.setTextSize(1);
-        _canvas.fillRect(6, 6, 320, 18, TFT_WHITE);
-        _canvas.drawRect(6, 6, 320, 18, TFT_BLACK);
-        _canvas.setTextColor(TFT_BLACK, TFT_WHITE);
-        _canvas.drawString(_toast, 12, 9);
-    }
     _canvas.clearClipRect();
     if (full) {
         ESP_LOGI("ViewMap", "composition: %d tiles, %u read from SD, %u ms (cache %u)",
                  drawn, (unsigned)(_statTileReads - readsBefore),
                  (unsigned)(millis() - tCompose), (unsigned)_statTileReads);
+    }
+}
+
+// ---------------------------------------------------------------- vector
+
+void ViewMap::composeVectorScene(int x0, int y0, int x1, int y1) {
+    if (!_canvasReady || !_useVector || !_vector.isOpen()) return;
+    const uint32_t t0 = millis();
+    const uint32_t readsBefore = _vector.chunkReads();
+    const size_t payloadBefore = _vector.payloadBytes();
+
+    // Fill/label workspace: the rasteriser keeps its edge lists here (heap, not
+    // the 16 KB loop stack) - see the arena row of budget D6.
+    static constexpr size_t kScratchBytes = 64 * 1024;
+    if (!_vecScratch) {
+        _vecScratch = (uint8_t*)heap_caps_malloc(kScratchBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!_vecScratch) {
+            ESP_LOGE("ViewMap", "vector scratch not allocated");
+            return;
+        }
+    }
+
+    mm_canvas canvas;
+    canvas.pixels = (uint8_t*)_canvas.getBuffer();
+    canvas.width = 480;
+    canvas.height = CV_H;
+    canvas.stride = 480;
+    // the clip rect is the repaint region: a full compose is 0,0,480,CV_H and a
+    // pan strip is one narrow band (plan D5)
+    canvas.clip.x0 = (int32_t)x0 * MM_FP_ONE;
+    canvas.clip.y0 = (int32_t)y0 * MM_FP_ONE;
+    // clip bounds are closed and go through mm_px(): [x0, x1) means the last
+    // pixel column is x1-1, so the 24.8 upper bound must stay below x1
+    canvas.clip.x1 = (int32_t)x1 * MM_FP_ONE - 256;
+    canvas.clip.y1 = (int32_t)y1 * MM_FP_ONE - 256;
+    canvas.scratch = _vecScratch;
+    canvas.scratch_len = kScratchBytes;
+
+    // Map layers only in the clip rect; the theme inversion goes through the
+    // same fg/bg inversion the LUT applies to raster tiles.
+    const bool dark = MeshService::getInstance().getMapDarkTheme();
+    mm_theme theme;
+    theme.fg = dark ? 255 : 0;
+    theme.bg = dark ? 0 : 255;
+
+    // Fill the repaint region with the background first (mm_render draws the
+    // layers on top; anything not covered stays background).
+    _canvas.fillRect(x0, y0, x1 - x0, y1 - y0, dark ? TFT_BLACK : TFT_WHITE);
+
+    mm_view view;
+    const double n2 = pow(2.0, _zoomLevel);
+    view.z = _zoomLevel;
+    view.cx = (_centerLon + 180.0) / 360.0 * n2 * TILE_SIZE;
+    view.cy = (1.0 - asinh(tan(_centerLat * DEG2RAD)) / M_PI) / 2.0 * n2 * TILE_SIZE;
+    view.width = 480;
+    view.height = CV_H;
+
+    // Full frames rebuild the label layout; a pan strip only redraws the cached
+    // set shifted (plan D5 hysteresis: no label pop mid-gesture).
+    const bool fullFrame = (x0 == 0 && y0 == 0 && x1 == 480 && y1 == CV_H);
+    const uint32_t rebuildsBefore = _labelCache.rebuilds;
+    const uint32_t fillsBefore = _vector.windowFills();
+    if (mm_render_view_cached_ex(_vector.map(), _vector.chunks(), &view, &canvas, &theme,
+                                 &_labelCache, fullFrame ? 1 : 0) != 0) {
+        ESP_LOGW("ViewMap", "vector render failed");
+    }
+
+    // Diagnostics (plan Fase 3.5): frame time, SD traffic and memory headroom
+    // are the numbers the device collaudo checks against the D6 budget.
+    if (fullFrame) {
+        const uint32_t heapFree = (uint32_t)heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+        ESP_LOGI("ViewMap",
+                 "vector frame: %u ms, %u chunk reads (%u B), %u win fills, labels %s (%u), "
+                 "pinned L %u KB, preload %u KB, PSRAM free %u KB",
+                 (unsigned)(millis() - t0), (unsigned)(_vector.chunkReads() - readsBefore),
+                 (unsigned)(_vector.payloadBytes() - payloadBefore),
+                 (unsigned)(_vector.windowFills() - fillsBefore),
+                 (_labelCache.rebuilds != rebuildsBefore) ? "rebuilt" : "cached",
+                 (unsigned)(_labelCache.rebuilds - rebuildsBefore),
+                 (unsigned)(_vector.pinnedBytes() / 1024),
+                 (unsigned)(_vector.preloadBytes() / 1024), (unsigned)(heapFree / 1024));
     }
 }
 
@@ -1393,10 +1650,10 @@ void ViewMap::draw(M5GFX& gfx) {
     // Put the composed map into the panel frame buffer: the full-screen refresh that
     // follows draw() sends it together with the rest of the UI.
     M5.Display.pushImage(0, MAP_TOP, 480, CV_H, (const lgfx::grayscale_t*)_canvas.getBuffer());
-    // NOTE: the action buttons live *inside* the canvas (composeScene draws them), so they must not
-    // be drawn again here: drawActionButtons() works in canvas coordinates and doing it on the
-    // display painted a second, 78 px higher copy of both buttons (the "duplicated buttons" glitch
-    // seen right after waking up from standby).
+    _canvasPushed = true;
+    // Screen-fixed UI is drawn on the display after the push, never in the
+    // scrollable canvas (see drawFixedOverlays).
+    drawFixedOverlays(M5.Display);
     drawInfoCard(gfx);
     _dirtyFast = false;
     _needsSettle = false;
@@ -1433,20 +1690,20 @@ void ViewMap::drawGrid(bool withCrosshair) {
     _canvas.drawCircle(MAP_CX, CV_CY, 8, TFT_BLACK);
 }
 
-void ViewMap::drawScaleBar() {
+void ViewMap::drawScaleBar(lgfx::LGFXBase& gfx) {
     const double scaleMeters = metersPerPixel() * 100.0;
     char scaleStr[24];
     if (scaleMeters >= 1000.0) snprintf(scaleStr, sizeof(scaleStr), "%.1f km", scaleMeters / 1000.0);
     else snprintf(scaleStr, sizeof(scaleStr), "%.0f m", scaleMeters);
 
-    const int y = CV_TILE_BOTTOM - 14;
-    _canvas.drawFastHLine(20, y, 100, TFT_BLACK);
-    _canvas.drawFastVLine(20, y - 6, 13, TFT_BLACK);
-    _canvas.drawFastVLine(120, y - 6, 13, TFT_BLACK);
-    _canvas.setTextColor(TFT_BLACK, TFT_WHITE);
-    _canvas.setTextDatum(textdatum_t::bottom_center);
-    _canvas.setTextSize(1);
-    _canvas.drawString(scaleStr, 70, y - 6);
+    const int y = MAP_TOP + CV_TILE_BOTTOM - 14;   // display coordinates
+    gfx.drawFastHLine(20, y, 100, TFT_BLACK);
+    gfx.drawFastVLine(20, y - 6, 13, TFT_BLACK);
+    gfx.drawFastVLine(120, y - 6, 13, TFT_BLACK);
+    gfx.setTextColor(TFT_BLACK, TFT_WHITE);
+    gfx.setTextDatum(textdatum_t::bottom_center);
+    gfx.setTextSize(1);
+    gfx.drawString(scaleStr, 70, y - 6);
 }
 
 void ViewMap::drawNodes(double latRad, double mpp) {
@@ -1551,8 +1808,8 @@ void ViewMap::drawActionButtons(lgfx::LGFXBase& gfx) {
             break;
         }
     }
-    const int yLoc = FAB_LOC_Y - MAP_TOP;
-    const int yPin = FAB_PIN_Y - MAP_TOP;
+    const int yLoc = FAB_LOC_Y;   // display coordinates
+    const int yPin = FAB_PIN_Y;
 
     // My location (crosshair) / set position here (pin)
     gfx.fillRoundRect(FAB_X, yLoc, FAB_W, FAB_H, 8, TFT_WHITE);

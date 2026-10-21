@@ -13,6 +13,27 @@
 
 static constexpr const char* TAG = "MonoMesh-Main";
 
+// Boot counter in the RTC domain: it survives software resets but not a power
+// cycle. If it grows on every wake attempt, the board is resetting instead of
+// resuming from light sleep (the "red LED blinks, nothing happens" symptom).
+RTC_DATA_ATTR static uint32_t s_bootCount = 0;
+
+static const char* resetReasonName(esp_reset_reason_t reason) {
+    switch (reason) {
+        case ESP_RST_POWERON:   return "power-on";
+        case ESP_RST_EXT:       return "external";
+        case ESP_RST_SW:        return "software";
+        case ESP_RST_PANIC:     return "panic";
+        case ESP_RST_INT_WDT:   return "int-wdt";
+        case ESP_RST_TASK_WDT:  return "task-wdt";
+        case ESP_RST_WDT:       return "wdt";
+        case ESP_RST_DEEPSLEEP: return "deep-sleep";
+        case ESP_RST_BROWNOUT:  return "brownout";
+        case ESP_RST_SDIO:      return "sdio";
+        default:                return "unknown";
+    }
+}
+
 // Clock peek (CLOCK / CLOCK+RX): BtnA/BtnB light the frontlight for a few seconds instead of
 // leaving the mode. 25% unless the user set a different non-zero brightness.
 static constexpr uint8_t CLOCK_PEEK_BRIGHTNESS = 25;
@@ -36,6 +57,10 @@ void setup() {
         Serial.println("=================================================");
     }
     ESP_LOGI(TAG, "Booting MonoMesh...");
+    ++s_bootCount;
+    ESP_LOGI(TAG, "Reset reason: %s (%d), boot #%u",
+             resetReasonName(esp_reset_reason()), (int)esp_reset_reason(),
+             (unsigned)s_bootCount);
 
     // Retrieve saved brightness from NVS before initializing display to prevent 100% blast
     uint8_t initBrightness = StorageManager::getQuickFrontlight();
@@ -341,9 +366,12 @@ static void handleLowPowerMode() {
     if (clockLightOn && requestMs > CLOCK_PEEK_SLICE_MS) requestMs = CLOCK_PEEK_SLICE_MS;
 
     // In the clock modes the minute-aligned slices also wake on the two buttons, so a short tap is
-    // caught instantly instead of slipping through the sleep. Never armed while a button is already
-    // down (it would wake on the level immediately) or while the power button is held.
+    // caught instantly instead of slipping through the sleep: the PM1 IRQ line (power button, the
+    // only exit from CLOCK) is armed with the same gating, and lowPowerLightSleep() skips the arm
+    // when the line is not idle. Never armed while a button is already down (it would wake on the
+    // level immediately) or while the power button is held.
     const bool armButtonWake = clockMode && !buttonDown && !M5.BtnPWR.isPressed();
+    const bool armPm1Wake = armButtonWake;
 
     bool slept = false;
     uint32_t sleptMs = 0;
@@ -351,14 +379,14 @@ static void handleLowPowerMode() {
     if (!radioOn) {
         // Radio parked: no mutex dance needed, nothing else touches the SPI bus.
         const uint32_t before = millis();
-        wakeCause = bsp.lowPowerLightSleep(requestMs, armButtonWake);
+        wakeCause = bsp.lowPowerLightSleep(requestMs, armButtonWake, armPm1Wake);
         sleptMs = millis() - before;
         slept = true;
     } else if (mesh.waitRadioIdle(100) && mesh.lockRadio(200)) {
         // The radio mutex is held across the sleep so the core-0 task cannot be frozen in the middle
         // of an SPI transaction (light sleep stalls the other core wherever it is).
         const uint32_t before = millis();
-        wakeCause = bsp.lowPowerLightSleep(requestMs, armButtonWake);
+        wakeCause = bsp.lowPowerLightSleep(requestMs, armButtonWake, armPm1Wake);
         mesh.unlockRadio();
         sleptMs = millis() - before;
         // Let the radio task hand over a frame that arrived during the sleep

@@ -1948,6 +1948,8 @@ def place_labels(entries, z):
     """
     kinds = zoom_label_kinds(z)
     budget = label_budget(z)
+    n = 2.0 ** z
+    window_count = {}   # anchor windows with at least one candidate (early exit)
     candidates = []
     for entry in entries:
         lat, lon, kind, name = entry[0], entry[1], entry[2], entry[3]
@@ -1955,15 +1957,18 @@ def place_labels(entries, z):
         if kind not in kinds or not name:
             continue
         candidates.append((place_score(kind, population), name, lat, lon, kind))
+        window = (int(math.floor(world_x(lat, lon, n))),
+                  int(math.floor(world_y(lat, lon, n))))
+        window_count[window] = window_count.get(window, 0) + 1
     if not candidates:
         return {}
     # Name breaks the score ties: the same data must place the same labels even
     # when two places share a population (or their kind's default score).
     candidates.sort(key=lambda e: (-e[0], e[1]))
 
-    n = 2.0 ** z
     placed_boxes = {}   # {(tx, ty): [global box, ...]}, for cheap overlap tests
     per_window = {}     # {(tx, ty): placed count}, the _LABEL_BUDGET per 256px tile
+    saturated = 0       # windows already at budget: when all are full, stop
     out = {}
     for _score, name, lat, lon, kind in candidates:
         font, dot_r = label_font(kind, z)
@@ -1991,6 +1996,12 @@ def place_labels(entries, z):
         for key in _box_tiles(box):
             placed_boxes.setdefault(key, []).append(box)
         per_window[(ax, ay)] = per_window.get((ax, ay), 0) + 1
+        if per_window[(ax, ay)] == budget:
+            saturated += 1
+            if saturated >= len(window_count):
+                # Every window with candidates has spent its budget: no
+                # remaining candidate (lower score) could be placed anyway.
+                break
         # The dot belongs to the label as well: an anchor at the very edge can
         # leave the text box in the next tile and still have the dot here, so
         # the tile assignment follows the union of both.
@@ -2311,13 +2322,50 @@ def load_or_extract(pbf_path, bbox, area_name, cache_dir=None, force=False, verb
     return data
 
 
+def _default_basemap_builder(target, cache_dir=None, deflate_level=6, verbose=True):
+    """Builds ``target`` from Natural Earth (see tools/basemap_generator.py)."""
+    try:
+        import basemap_generator as bg
+    except ImportError:  # pragma: no cover - only when imported from elsewhere
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import basemap_generator as bg
+    cache_dir = cache_dir or bg.default_cache_dir()
+    land = bg.download_natural_earth("ne_110m_land", "physical", "110m", cache_dir)
+    borders = bg.download_natural_earth("ne_110m_admin_0_boundary_lines_land",
+                                        "cultural", "110m", cache_dir)
+    bg.build_basemap(bg.load_shapes(land), bg.load_shapes(borders), target,
+                     zoom_levels=range(0, 8), deflate_level=deflate_level,
+                     verbose=verbose)
+
+
+def ensure_basemap(out_dir, cache_dir=None, deflate_level=6, force=False,
+                   verbose=True, builder=None):
+    """Makes sure ``<out_dir>/basemap.mmap`` exists; returns its path or None.
+
+    The global z0-7 fallback is a courtesy artifact, never a reason to fail the
+    run: a missing network and an empty cache only produce a warning, and the
+    final summary states that there is no coverage outside the region.
+    """
+    target = os.path.join(out_dir, "basemap.mmap")
+    if os.path.exists(target) and not force:
+        return target
+    build = builder or _default_basemap_builder
+    try:
+        build(target, cache_dir=cache_dir, deflate_level=deflate_level, verbose=verbose)
+    except Exception as err:
+        print(f"[!] basemap not generated ({err}); the map has no global coverage "
+              f"outside the region")
+        return None
+    return target if os.path.exists(target) else None
+
+
 def generate_tiles_from_pbf(pbf_path, min_lat, min_lon, max_lat, max_lon, zoom_levels,
                             output_dir="./tiles", area_name="area",
                             force=False, jobs=None, png_mode="fast", cache_dir=None,
                             keep_existing=True, verbose=True, out_format="png",
                             mmap_out=None, bits=1, deflate_level=6, benchmark=False,
                             plan_only=False, max_tiles=200000, whole_pbf=False,
-                            no_poi=False):
+                            no_poi=False, basemap=True):
     bbox = (min_lat, min_lon, max_lat, max_lon)
     t_pipeline = time.time()
     use_png = out_format in ("png", "both")
@@ -2326,6 +2374,31 @@ def generate_tiles_from_pbf(pbf_path, min_lat, min_lon, max_lat, max_lon, zoom_l
     if jobs is None:
         jobs = max(1, (os.cpu_count() or 2) - 1)
     jobs = max(1, int(jobs))
+
+    mmap_target = ""
+    if use_mmap:
+        mmap_target = mmap_out or os.path.join(output_dir, f"{area_name}.mmap")
+
+    # A pure container run whose target already exists has nothing to do:
+    # skipping extraction, indexing and rendering is what makes a second run
+    # instant (and keeps the existing file as the baseline; --force regenerates).
+    # The basemap still runs, because "the region is already there, add the
+    # global fallback" is exactly this path.
+    if (use_mmap and not use_png and keep_existing and not force and not plan_only
+            and mmap_target and os.path.exists(mmap_target)):
+        if verbose:
+            print(f"[*] Container already present: {mmap_target} "
+                  f"(skipping generation, use --force to regenerate)")
+        basemap_path = None
+        if basemap:
+            basemap_path = ensure_basemap(output_dir, cache_dir=cache_dir,
+                                          deflate_level=deflate_level, verbose=verbose)
+            if basemap_path and verbose:
+                print(f"[*] basemap ready: {basemap_path}")
+        return {"rendered": 0, "skipped": 0, "bytes": 0, "seconds": 0.0,
+                "pipeline_seconds": time.time() - t_pipeline, "jobs": jobs,
+                "mmap": None, "stats": {}, "extract_seconds": 0.0,
+                "index_seconds": 0.0, "skipped_mmap": True, "basemap": basemap_path}
 
     # Pre-flight plan: tile counts and size are known before the (expensive)
     # extraction, so a "whole PBF" request cannot turn into a surprise overnight job.
@@ -2376,7 +2449,7 @@ def generate_tiles_from_pbf(pbf_path, min_lat, min_lon, max_lat, max_lon, zoom_l
         return {"rendered": 0, "skipped": skipped, "bytes": 0, "seconds": 0.0,
                 "pipeline_seconds": time.time() - t_pipeline, "jobs": jobs,
                 "mmap": None, "stats": {}, "extract_seconds": extract_time,
-                "index_seconds": 0.0}
+                "index_seconds": 0.0, "skipped_mmap": False, "basemap": None}
 
     total_count = sum(len(tiles) for tiles in pending.values())
     if verbose:
@@ -2429,9 +2502,7 @@ def generate_tiles_from_pbf(pbf_path, min_lat, min_lon, max_lat, max_lon, zoom_l
         tile_grids[z] = (gx0, gy0, gx1 - gx0 + 1, gy1 - gy0 + 1)
 
     writer = None
-    mmap_target = ""
     if use_mmap:
-        mmap_target = mmap_out or os.path.join(output_dir, f"{area_name}.mmap")
         os.makedirs(os.path.dirname(os.path.abspath(mmap_target)) or ".", exist_ok=True)
         writer = MapWriter(mmap_target, bits=bits, tile_px=256, name=area_name,
                            bbox=bbox, deflate_level=deflate_level,
@@ -2571,6 +2642,14 @@ def generate_tiles_from_pbf(pbf_path, min_lat, min_lon, max_lat, max_lon, zoom_l
     rendered = stats["tiles"]
     mb = total_bytes / (1024 * 1024)
 
+    # The global z0-7 fallback lives next to the region container: generating it
+    # on the first map removes the manual copy, and the existence check keeps
+    # every later run free.  A failure is only a warning.
+    basemap_path = None
+    if use_mmap and basemap:
+        basemap_path = ensure_basemap(output_dir, cache_dir=cache_dir,
+                                      deflate_level=deflate_level, verbose=verbose)
+
     parts = [
         "[✓] Toner rendering completed successfully!",
         f"    Tiles generated: {rendered} in {render_time:.2f}s "
@@ -2589,6 +2668,11 @@ def generate_tiles_from_pbf(pbf_path, min_lat, min_lon, max_lat, max_lon, zoom_l
             f"    Zooms in the container: {zooms}",
             f"    Container write: {mmap_seconds:.2f}s",
         ]
+        if basemap_path:
+            parts.append(f"    Global basemap: {os.path.basename(basemap_path)} "
+                         f"(z0-7 courtesy coverage, grey outside the region)")
+        else:
+            parts.append("    [!] No basemap.mmap: outside the region there is no global coverage")
     parts.append("")
     parts.append("[*] How to use on M5Stack Paper Mono:")
     if use_png:
@@ -2597,6 +2681,11 @@ def generate_tiles_from_pbf(pbf_path, min_lat, min_lon, max_lat, max_lon, zoom_l
     if mmap_stats:
         parts.append(f"    Copy '{os.path.basename(mmap_target)}' (a single file) into the /maps folder of the MicroSD:")
         parts.append("    Final path on MicroSD: /sdcard/maps/<region>.mmap")
+        if basemap_path:
+            parts.append(f"    Also copy '{os.path.basename(basemap_path)}' into /maps:")
+            parts.append("    Final path on MicroSD: /sdcard/maps/basemap.mmap")
+            parts.append("    (global z0-7 base: outside the region it shows in grey, "
+                         "beyond its coverage the hatch marks 'no data')")
     parts += [
         "",
         "    Theme (light/dark) is a setting of the device, not of the container.",
@@ -2640,7 +2729,7 @@ def generate_tiles_from_pbf(pbf_path, min_lat, min_lon, max_lat, max_lon, zoom_l
     return {"rendered": rendered, "skipped": skipped, "bytes": total_bytes,
             "seconds": render_time, "pipeline_seconds": pipeline_time, "jobs": jobs,
             "mmap": mmap_stats, "stats": stats, "extract_seconds": extract_time,
-            "index_seconds": index_time}
+            "index_seconds": index_time, "skipped_mmap": False, "basemap": basemap_path}
 
 
 # --------------------------------------------------------------------------- #
@@ -2804,14 +2893,14 @@ def run_tui():
     force_choice = input("Overwrite existing tiles if present? (y/N): ").strip().lower()
     force = force_choice in ("y", "yes")
 
-    # Pointers that matter once a first container exists: merging regions and a
-    # global fallback are one command away, but their tools stay CLI-only.
+    # Pointers that matter once a first container exists.  The basemap is
+    # generated automatically (see ensure_basemap), so it is not advertised
+    # here: the summary lists it together with the region file.
     existing = glob.glob(os.path.join(out_dir, "*.mmap"))
     if existing:
         print(f"\n[i] {len(existing)} container(s) already in {out_dir}.")
         print("    To merge several regions into one file: "
               "python3 tools/mono_map.py merge out.mmap in1.mmap in2.mmap")
-    print("[i] Global z0-7 courtesy coverage: python3 tools/basemap_generator.py")
 
     plan = tile_plan((min_lat, min_lon, max_lat, max_lon), zooms, bits=bits)
     print_tile_plan(plan, jobs, out_format, bits, whole_pbf=whole_pbf,
@@ -2879,6 +2968,8 @@ def main():
                         help="Safety limit on the number of tiles per run (0 = no limit)")
     parser.add_argument("--no-poi", action="store_true",
                         help="Do not include the place index in the container")
+    parser.add_argument("--no-basemap", action="store_true",
+                        help="Do not generate the global z0-7 basemap.mmap next to the container")
     parser.add_argument("--cache-dir", type=str, default=None, help="Cache folder (default: <pbf dir>/.pbf_cache)")
     parser.add_argument("--quiet", action="store_true", help="Reduce output")
 
@@ -2984,6 +3075,7 @@ def main():
         max_tiles=args.max_tiles,
         whole_pbf=whole_pbf,
         no_poi=args.no_poi,
+        basemap=not args.no_basemap,
         verbose=not args.quiet,
     )
 

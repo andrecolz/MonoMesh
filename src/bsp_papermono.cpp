@@ -66,11 +66,17 @@ bool BSP::init(uint8_t initialBrightness) {
     // Latch the PM1 wake source NOW: M5.begin() clears it (Power_Class::begin for M5PaperMono calls
     // M5pm1.clearWakeSource()), so this is the only moment where the RTC-alarm power-on is readable.
     // The RX8130 /IRQ drives PM1 G0, so EXT_WAKE means the alarm powered the board back on.
+    // MONOMESH_DISABLE_EARLY_PM1_WAKE builds the diagnosis variant without the raw I2C probe before
+    // M5.begin() (the post-M5.begin() path below is unaffected).
+#ifndef MONOMESH_DISABLE_EARLY_PM1_WAKE
     uint8_t earlyWakeSrc = 0;
     if (readPm1WakeSourceEarly(earlyWakeSrc) && (earlyWakeSrc & M5PM1_WAKE_SRC_EXT_WAKE)) {
         _bootFromRtcAlarm = true;
         ESP_LOGI(TAG, "Boot wake source: external GPIO (RTC alarm via PM1 G0)");
     }
+#else
+    ESP_LOGW(TAG, "readPm1WakeSourceEarly disabled by MONOMESH_DISABLE_EARLY_PM1_WAKE");
+#endif
 
     // 1. Initialize M5Unified first (sets up M5.In_I2C and board autodetect)
     auto cfg = M5.config();
@@ -383,6 +389,7 @@ bool BSP::checkPowerButton() {
         M5.BtnPWR.wasClicked();
         bool bootFlag = false;
         _pm1.btnGetFlag(&bootFlag);
+        _pm1BtnLatch = false;
         return false;
     }
 
@@ -392,7 +399,17 @@ bool BSP::checkPowerButton() {
         M5.BtnPWR.wasHold();
         bool flag = false;
         _pm1.btnGetFlag(&flag);
+        _pm1BtnLatch = false;
         return false;
+    }
+
+    // A press captured by lowPowerLightSleep() while the CPU was asleep: the PM1 latch had to be
+    // drained to release the IRQ line, but the event is still a valid exit request. Without this
+    // the power button was lost exactly in the clock modes, where it is the only way out.
+    if (_pm1BtnLatch) {
+        _pm1BtnLatch = false;
+        ESP_LOGI(TAG, "Power button wake via PM1 latch (captured during light sleep)");
+        return true;
     }
 
     // 1. Check debounced click from M5Unified
@@ -568,6 +585,14 @@ void BSP::enterLowPower(PowerMode mode) {
     ESP_LOGI(TAG, "Entering %s mode...",
              (mode == PowerMode::Standby) ? "Standby Listening" :
              (mode == PowerMode::Clock) ? "Clock (radio off)" : "Standby+Clock (radio listening)");
+    // Diagnosis trail for the standby reports: mode, battery and PM1 latch at
+    // the moment the device goes idle (see the boot counter in main.cpp).
+    const BatteryState bs = getBatteryState();
+    bool pm1Flag = false;
+    if (_pm1Ready) _pm1.btnGetFlag(&pm1Flag);
+    ESP_LOGI(TAG, "enterLowPower: mode=%u battery=%d mV %u%% charging=%d pm1BtnFlag=%d",
+             (unsigned)mode, bs.voltageMv, (unsigned)bs.percentage,
+             bs.isCharging ? 1 : 0, pm1Flag ? 1 : 0);
 
     _powerMode = mode;
     _lowPowerStartMillis = millis();
@@ -607,6 +632,8 @@ void BSP::enterLowPower(PowerMode mode) {
     M5.BtnB.wasClicked();
     bool dummyFlag = false;
     _pm1.btnGetFlag(&dummyFlag);
+    // The press that opened the mode must not come back as a wake request.
+    _pm1BtnLatch = false;
 
     // The Clock mode leaves the radio out of the picture on purpose: park it before idling the rails
     // so it is not left receiving while its neighbours disappear.
@@ -624,6 +651,12 @@ void BSP::exitLowPower(uint8_t restoreBrightness) {
     if (_powerMode == PowerMode::None) return;
     const bool clock = (_powerMode == PowerMode::Clock || _powerMode == PowerMode::StandbyClock);
     ESP_LOGI(TAG, "Waking up from low-power mode (%u)...", (unsigned)_powerMode);
+    const BatteryState bs = getBatteryState();
+    bool pm1Flag = false;
+    if (_pm1Ready) _pm1.btnGetFlag(&pm1Flag);
+    ESP_LOGI(TAG, "exitLowPower: mode=%u battery=%d mV %u%% charging=%d pm1BtnFlag=%d",
+             (unsigned)_powerMode, bs.voltageMv, (unsigned)bs.percentage,
+             bs.isCharging ? 1 : 0, pm1Flag ? 1 : 0);
 
     _powerMode = PowerMode::None;
 
@@ -644,6 +677,8 @@ void BSP::exitLowPower(uint8_t restoreBrightness) {
     M5.BtnPWR.wasHold();
     bool flag = false;
     _pm1.btnGetFlag(&flag);
+    // The exit request has been served: no stale latch may trigger another action.
+    _pm1BtnLatch = false;
 
     // Restore frontlight
     _currentBrightness = restoreBrightness;
@@ -676,6 +711,13 @@ void BSP::lowPowerPeripheralsOff() {
         _pm1.irqClearSysAll();
         bool flag = false;
         _pm1.btnGetFlag(&flag);
+        uint8_t gpioMask = 0, sysMask = 0, btnMask = 0;
+        _pm1.irqGetGpioMaskBits(&gpioMask);
+        _pm1.irqGetSysMaskBits(&sysMask);
+        _pm1.irqGetBtnMaskBits(&btnMask);
+        ESP_LOGI(TAG, "PM1 IRQ masks: gpio=0x%02x sys=0x%02x btn=0x%02x "
+                 "(mask bit set = ignored; button line unmasked wakes the board)",
+                 gpioMask, sysMask, btnMask);
     }
     ESP_LOGI(TAG, "Low-power peripherals idled (SD rail off, IMU suspend=%d, PM1 IRQ armed)", imuOk ? 1 : 0);
 }
@@ -692,22 +734,44 @@ void BSP::lowPowerPeripheralsOn() {
              StorageManager::getInstance().isSdMounted() ? 1 : 0);
 }
 
-// Arm the two user buttons as a light-sleep GPIO wake source (active low: pressed = low). The pins
-// stay plain GPIOs with their pull-ups; unlike the DIO1 trap this is armed only around the sleep and
-// disarmed immediately after, so no level-triggered interrupt can outlive the wake.
-void BSP::armButtonWake() {
+// Arm the two user buttons (and optionally the PM1 IRQ line) as a light-sleep GPIO wake source
+// (active low: pressed = low). The pins stay plain GPIOs with their pull-ups; unlike the DIO1 trap
+// this is armed only around the sleep and disarmed immediately after, so no level-triggered
+// interrupt can outlive the wake.
+void BSP::armButtonWake(bool includePm1Irq) {
     gpio_wakeup_enable((gpio_num_t)Pins::KEY1, GPIO_INTR_LOW_LEVEL);
     gpio_wakeup_enable((gpio_num_t)Pins::KEY2, GPIO_INTR_LOW_LEVEL);
+    if (includePm1Irq) gpio_wakeup_enable((gpio_num_t)Pins::PM1_IRQ, GPIO_INTR_LOW_LEVEL);
     esp_sleep_enable_gpio_wakeup();
 }
 
-void BSP::disarmButtonWake() {
+void BSP::disarmButtonWake(bool includePm1Irq) {
     gpio_wakeup_disable((gpio_num_t)Pins::KEY1);
     gpio_wakeup_disable((gpio_num_t)Pins::KEY2);
+    if (includePm1Irq) gpio_wakeup_disable((gpio_num_t)Pins::PM1_IRQ);
     esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_GPIO);
 }
 
-esp_sleep_wakeup_cause_t BSP::lowPowerLightSleep(uint32_t maxSleepMs, bool buttonWake) {
+bool BSP::pm1IrqIsIdle() {
+    if (digitalRead(Pins::PM1_IRQ) != LOW) return true;
+    if (!_pm1Ready) return false;
+    // Drain the latched statuses before arming a level wake: the button "wake event" bit
+    // (IRQ_STATUS3 bit 1) is not cleared by M5Unified's click read, and a sleep armed on an
+    // asserted line would return at once every time. A real button flag found here is latched,
+    // not dropped: the wake loop still consumes it through checkPowerButton().
+    _pm1.irqClearGpioAll();
+    _pm1.irqClearSysAll();
+    _pm1.irqClearBtnAll();
+    bool flag = false;
+    if (_pm1.btnGetFlag(&flag) == M5PM1_OK && flag) {
+        _pm1BtnLatch = true;
+        ESP_LOGI(TAG, "PM1 button event found while preparing the sleep (latched)");
+    }
+    delay(2);
+    return digitalRead(Pins::PM1_IRQ) != LOW;
+}
+
+esp_sleep_wakeup_cause_t BSP::lowPowerLightSleep(uint32_t maxSleepMs, bool buttonWake, bool pm1Wake) {
     // Never arm a 0 us timer: it would return immediately and spin the low-power loop.
     if (maxSleepMs == 0) maxSleepMs = 1;
     // TIMER-ONLY light sleep by default. GPIO wake (gpio_wakeup_enable) reconfigures the pin as an RTC
@@ -715,16 +779,26 @@ esp_sleep_wakeup_cause_t BSP::lowPowerLightSleep(uint32_t maxSleepMs, bool butto
     // until the radio IRQ flags are cleared, which produced an interrupt storm on CPU1 and an
     // Interrupt WDT panic right after the next TX. Sleeping in short slices and polling instead keeps
     // the radio and the GPIO configuration exactly as RadioLib set them, at the cost of ~1 mA average.
-    // The buttonWake path is the exception: the two user keys are plain GPIOs with pull-ups and are
-    // disarmed immediately after the wake, so the clock modes can sleep to the minute without losing
-    // a short tap. DIO1 is never part of it.
+    // The buttonWake / pm1Wake path is the exception: the two user keys are plain GPIOs with pull-ups
+    // and the PM1 IRQ is a push-pull active-low output, all disarmed immediately after the wake, so
+    // the clock modes can sleep to the minute without losing the power button. DIO1 is never part of
+    // it. The PM1 line is armed only when idle: a pending event skips the sleep once instead of
+    // bouncing off the level wake in a tight loop.
+    bool armPm1 = false;
+    if (pm1Wake) {
+        armPm1 = pm1IrqIsIdle();
+        if (!armPm1 && _pm1BtnLatch) {
+            ESP_LOGI(TAG, "PM1 button event pending: skipping the sleep to process it");
+            return ESP_SLEEP_WAKEUP_GPIO; // fabricated cause: no phantom-wake accounting
+        }
+    }
     esp_sleep_enable_timer_wakeup((uint64_t)maxSleepMs * 1000ULL);
-    if (buttonWake) armButtonWake();
+    if (buttonWake || armPm1) armButtonWake(armPm1);
 
     uint32_t before = millis();
     esp_err_t sleepErr = esp_light_sleep_start();
     esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
-    if (buttonWake) disarmButtonWake();
+    if (buttonWake || armPm1) disarmButtonWake(armPm1);
     if (sleepErr != ESP_OK) {
         ESP_LOGE(TAG, "esp_light_sleep_start failed: %d (0x%x)", (int)sleepErr, (unsigned)sleepErr);
     }
@@ -736,15 +810,24 @@ esp_sleep_wakeup_cause_t BSP::lowPowerLightSleep(uint32_t maxSleepMs, bool butto
         ESP_LOGI(TAG, "Low-power sleep cycle: %u ms asleep, cause=%d, lines DIO1=%d KEY1=%d KEY2=%d PM1=%d",
                  (unsigned)sleptMs, (int)cause, digitalRead(Pins::LORA_DIO1), digitalRead(Pins::KEY1),
                  digitalRead(Pins::KEY2), digitalRead(Pins::PM1_IRQ));
+    } else if (cause != ESP_SLEEP_WAKEUP_TIMER) {
+        // A non-timer wake (button/GPIO) is always worth a line: it is the path
+        // the standby diagnosis cares about.
+        ESP_LOGI(TAG, "Light-sleep wake: cause=%d after %u ms (PM1 latch=%d KEY1=%d KEY2=%d)",
+                 (int)cause, (unsigned)sleptMs, digitalRead(Pins::PM1_IRQ),
+                 digitalRead(Pins::KEY1), digitalRead(Pins::KEY2));
     }
 
     // Safety: if the PM1 or the radio is still holding a wake line asserted we would spin in a wake
-    // loop. Clear the PM1 flags so its open-drain IRQ releases.
+    // loop. Clear the PM1 flags so its IRQ releases. The button flag read is destructive: keep the
+    // press in the latch, checkPowerButton() consumes it as the clock modes' only exit.
     if (_pm1Ready && digitalRead(Pins::PM1_IRQ) == LOW) {
         _pm1.irqClearGpioAll();
         _pm1.irqClearSysAll();
         bool flag = false;
-        _pm1.btnGetFlag(&flag);
+        if (_pm1.btnGetFlag(&flag) == M5PM1_OK && flag) {
+            _pm1BtnLatch = true;
+        }
     }
     return cause;
 }

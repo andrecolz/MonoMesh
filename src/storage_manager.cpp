@@ -210,16 +210,25 @@ bool StorageManager::initSdCard() {
     delay(300); // 300ms rail stabilization
 
     SD_MMC.setPins(13, 12, 11, 10, 9, 8); // CLK=13, CMD=12, D0=11, D1=10, D2=9, D3=8
-    if (!SD_MMC.begin("/sdcard", false, false, SDMMC_FREQ_DEFAULT, 5)) {
+    // High Speed first (40 MHz): the map bulk preloads and chunk reads run at
+    // twice the clock when the card and the board wiring take it.  Fall back to
+    // the 20 MHz default and then 1-bit so a slow card still mounts.
+    bool mounted = SD_MMC.begin("/sdcard", false, false, SDMMC_FREQ_HIGHSPEED, 5);
+    if (!mounted) {
+        ESP_LOGW(TAG, "SD_MMC 40 MHz 4-bit mount failed, trying 20 MHz...");
+        mounted = SD_MMC.begin("/sdcard", false, false, SDMMC_FREQ_DEFAULT, 5);
+    }
+    if (!mounted) {
         ESP_LOGW(TAG, "SD_MMC 4-bit mount failed, trying 1-bit mode...");
-        if (!SD_MMC.begin("/sdcard", true, false, SDMMC_FREQ_DEFAULT, 5)) {
-            ESP_LOGE(TAG, "SD_MMC mount failed entirely!");
-            SD_MMC.end();   // clear any half-open driver state so a later retry starts clean
-            _sdMounted = false;
-            _sdTotalBytes = 0;
-            _sdFreeBytes = 0;
-            return false;
-        }
+        mounted = SD_MMC.begin("/sdcard", true, false, SDMMC_FREQ_DEFAULT, 5);
+    }
+    if (!mounted) {
+        ESP_LOGE(TAG, "SD_MMC mount failed entirely!");
+        SD_MMC.end();   // clear any half-open driver state so a later retry starts clean
+        _sdMounted = false;
+        _sdTotalBytes = 0;
+        _sdFreeBytes = 0;
+        return false;
     }
 
     _sdMounted = true;

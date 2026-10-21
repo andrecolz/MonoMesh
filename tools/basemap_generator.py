@@ -40,6 +40,12 @@ NE_URL_TEMPLATES = (
 )
 
 
+def default_cache_dir():
+    """Cache used when no --cache-dir is given: <repo>/.pbf_cache."""
+    return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                        ".pbf_cache")
+
+
 def download_natural_earth(name, category, resolution, cache_dir):
     """Returns the .shp path, downloading and extracting the zip when missing."""
     import requests
@@ -228,8 +234,7 @@ def main(argv=None) -> int:
     ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args(argv)
 
-    cache_dir = args.cache_dir or os.path.join(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".pbf_cache")
+    cache_dir = args.cache_dir or default_cache_dir()
     verbose = not args.quiet
     land_shp = download_natural_earth(f"ne_{args.resolution}_land", "physical",
                                       args.resolution, cache_dir)

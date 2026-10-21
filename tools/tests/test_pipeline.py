@@ -20,6 +20,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 import osmium
@@ -687,13 +688,198 @@ class TestPipeline(SyntheticFixture):
                 fot.generate_tiles_from_pbf(self.pbf, *bbox, [13], output_dir=out,
                                             area_name="synth_fail", force=True, jobs=1,
                                             cache_dir=cache_dir, verbose=False,
-                                            out_format="mmap")
+                                            out_format="mmap", basemap=False)
         finally:
             fot._render_one = original
             fot.MapWriter = original_writer
         self.assertTrue(temps, "il test deve esercitare MapWriter (serve out_format='mmap')")
         leftovers = [f for f in os.listdir(out) if f.startswith(".mmap-payload")]
         self.assertEqual(leftovers, [], f"temp rimasti: {leftovers}")
+
+
+class TestBasemapIntegration(SyntheticFixture):
+    """ensure_basemap and its wiring into generate_tiles_from_pbf (no network)."""
+
+    def _fake_builder(self, calls, bbox):
+        def build(target, **kw):
+            calls.append(target)
+            w = fot.MapWriter(target, bits=1, tile_px=256, name="basemap", bbox=bbox)
+            w.add_tile_compressed(0, 0, 0, b"", blank=2)
+            w.close()
+        return build
+
+    def test_ensure_basemap_creates_then_reuses(self):
+        out = os.path.join(self.tmp, "bm")
+        os.makedirs(out, exist_ok=True)
+        calls = []
+        builder = self._fake_builder(calls, self.info["bbox"])
+        path = fot.ensure_basemap(out, verbose=False, builder=builder)
+        self.assertEqual(path, os.path.join(out, "basemap.mmap"))
+        self.assertTrue(os.path.exists(path))
+        self.assertEqual(len(calls), 1)
+        # already there: no rebuild, no builder call
+        self.assertEqual(fot.ensure_basemap(out, verbose=False, builder=builder), path)
+        self.assertEqual(len(calls), 1)
+
+    def test_ensure_basemap_failure_is_only_a_warning(self):
+        out = os.path.join(self.tmp, "bm_fail")
+        os.makedirs(out, exist_ok=True)
+
+        def broken(target, **kw):
+            raise RuntimeError("no network")
+
+        self.assertIsNone(fot.ensure_basemap(out, verbose=False, builder=broken))
+
+    def test_generate_wires_basemap_and_no_basemap_flag(self):
+        bbox = self.info["bbox"]
+        cache = os.path.join(self.tmp, "bm_cache")
+        calls = []
+        orig = fot._default_basemap_builder
+        fot._default_basemap_builder = self._fake_builder(calls, bbox)
+        try:
+            out = os.path.join(self.tmp, "bm_run")
+            res = fot.generate_tiles_from_pbf(self.pbf, *bbox, [12], output_dir=out,
+                                              area_name="bm", force=True, jobs=1,
+                                              cache_dir=cache, verbose=False,
+                                              out_format="mmap")
+            self.assertTrue(os.path.exists(os.path.join(out, "basemap.mmap")))
+            self.assertEqual(res["basemap"], os.path.join(out, "basemap.mmap"))
+            self.assertEqual(len(calls), 1)
+
+            out2 = os.path.join(self.tmp, "bm_off")
+            res2 = fot.generate_tiles_from_pbf(self.pbf, *bbox, [12], output_dir=out2,
+                                               area_name="bm_off", force=True, jobs=1,
+                                               cache_dir=cache, verbose=False,
+                                               out_format="mmap", basemap=False)
+            self.assertFalse(os.path.exists(os.path.join(out2, "basemap.mmap")))
+            self.assertIsNone(res2["basemap"])
+            self.assertEqual(len(calls), 1)
+        finally:
+            fot._default_basemap_builder = orig
+
+    def test_png_only_never_creates_basemap(self):
+        bbox = self.info["bbox"]
+        out = os.path.join(self.tmp, "bm_png")
+        calls = []
+        orig = fot._default_basemap_builder
+        fot._default_basemap_builder = self._fake_builder(calls, bbox)
+        try:
+            fot.generate_tiles_from_pbf(self.pbf, *bbox, [12], output_dir=out,
+                                        area_name="bm_png", force=True, jobs=1,
+                                        cache_dir=os.path.join(self.tmp, "bm_png_cache"),
+                                        verbose=False, out_format="png")
+            self.assertFalse(os.path.exists(os.path.join(out, "basemap.mmap")))
+            self.assertEqual(calls, [])
+        finally:
+            fot._default_basemap_builder = orig
+
+
+class TestMmapKeepExisting(SyntheticFixture):
+    """A pure .mmap run with the target already on disk must not render again."""
+
+    def _generate(self, out, cache, force, out_format="mmap", basemap=True):
+        bbox = self.info["bbox"]
+        return fot.generate_tiles_from_pbf(self.pbf, *bbox, [12], output_dir=out,
+                                           area_name="keep", force=force, jobs=1,
+                                           cache_dir=cache, verbose=False,
+                                           out_format=out_format, basemap=basemap)
+
+    def test_second_run_skips_and_basemap_is_ensured(self):
+        out = os.path.join(self.tmp, "keep")
+        cache = os.path.join(self.tmp, "keep_cache")
+        calls = []
+        orig = fot._default_basemap_builder
+        fot._default_basemap_builder = TestBasemapIntegration._fake_builder(
+            self, calls, self.info["bbox"])
+        try:
+            res = self._generate(out, cache, force=True)
+            self.assertGreater(res["rendered"], 0)
+            self.assertFalse(res["skipped_mmap"])
+            mmap = os.path.join(out, "keep.mmap")
+            mtime = os.path.getmtime(mmap)
+
+            res2 = self._generate(out, cache, force=False)
+            self.assertTrue(res2["skipped_mmap"])
+            self.assertEqual(res2["rendered"], 0)
+            self.assertEqual(os.path.getmtime(mmap), mtime)
+            self.assertTrue(os.path.exists(os.path.join(out, "basemap.mmap")))
+            self.assertEqual(res2["basemap"], os.path.join(out, "basemap.mmap"))
+            self.assertEqual(len(calls), 1)
+
+            time.sleep(0.01)
+            res3 = self._generate(out, cache, force=True)
+            self.assertFalse(res3["skipped_mmap"])
+            self.assertGreater(res3["rendered"], 0)
+            self.assertGreater(os.path.getmtime(mmap), mtime)
+            self.assertEqual(len(calls), 1)   # basemap already present: no rebuild
+        finally:
+            fot._default_basemap_builder = orig
+
+    def test_both_format_still_renders_the_container(self):
+        out = os.path.join(self.tmp, "keep_both")
+        cache = os.path.join(self.tmp, "keep_both_cache")
+        res1 = self._generate(out, cache, force=True, out_format="both", basemap=False)
+        self.assertGreater(res1["rendered"], 0)
+        res2 = self._generate(out, cache, force=False, out_format="both", basemap=False)
+        self.assertFalse(res2["skipped_mmap"])
+        self.assertGreater(res2["rendered"], 0)   # PNG per-tile skip only
+
+
+class TestPlaceLabelsEarlyExit(unittest.TestCase):
+    """The saturation early exit must not change which labels get placed."""
+
+    @staticmethod
+    def _reference(entries, z):
+        """The same greedy placement without the early exit."""
+        kinds = fot.zoom_label_kinds(z)
+        budget = fot.label_budget(z)
+        n = 2.0 ** z
+        cands = []
+        for e in entries:
+            lat, lon, kind, name = e[0], e[1], e[2], e[3]
+            pop = e[4] if len(e) > 4 else 0
+            if kind not in kinds or not name:
+                continue
+            cands.append((fot.place_score(kind, pop), name, lat, lon, kind))
+        cands.sort(key=lambda e: (-e[0], e[1]))
+        placed_boxes, per_window, out = {}, {}, {}
+        for _score, name, lat, lon, kind in cands:
+            font, dot_r = fot.label_font(kind, z)
+            if font is None:
+                continue
+            wx, wy = fot.world_x(lat, lon, n), fot.world_y(lat, lon, n)
+            ax, ay = int(math.floor(wx)), int(math.floor(wy))
+            if per_window.get((ax, ay), 0) >= budget:
+                continue
+            px = int(round((wx - ax) * 256.0))
+            py = int(round((wy - ay) * 256.0))
+            x, y = px + dot_r + 3, py - 6
+            tb = fot._LABEL_MEASURE.textbbox((x, y), name, font=font, stroke_width=2)
+            box = (ax * 256 + tb[0], ay * 256 + tb[1],
+                   ax * 256 + tb[2], ay * 256 + tb[3])
+            if any(fot._boxes_overlap(box, b)
+                   for key in fot._box_tiles(box) for b in placed_boxes.get(key, ())):
+                continue
+            for key in fot._box_tiles(box):
+                placed_boxes.setdefault(key, []).append(box)
+            per_window[(ax, ay)] = per_window.get((ax, ay), 0) + 1
+            dot = (ax * 256 + px - dot_r, ay * 256 + py - dot_r,
+                   ax * 256 + px + dot_r + 1, ay * 256 + py + dot_r + 1)
+            cover = (min(box[0], dot[0]), min(box[1], dot[1]),
+                     max(box[2], dot[2]), max(box[3], dot[3]))
+            for tx, ty in fot._box_tiles(cover):
+                out.setdefault((tx, ty), []).append(
+                    (px - (tx - ax) * 256, py - (ty - ay) * 256, kind, name))
+        return out
+
+    def test_early_exit_is_bit_identical(self):
+        z = 13
+        entries = []
+        for i in range(600):
+            lat = 45.70 + (i % 20) * 0.002
+            lon = 9.00 + (i // 20) * 0.002
+            entries.append((lat, lon, 0, f"Paese {i:03d}", 1000 + i))
+        self.assertEqual(fot.place_labels(entries, z), self._reference(entries, z))
 
 
 class TestRealDataParity(unittest.TestCase):
